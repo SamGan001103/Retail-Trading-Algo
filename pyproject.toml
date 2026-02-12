@@ -1,0 +1,20 @@
+[tool.pyright]
+pythonPath = "."
+pythonVersion = "3.11"
+include = ["."]
+exclude = [".venv", "__pycache__", ".git"]
+reportMissingImports = false
+reportMissingModuleSource = false
+reportPrivateImportUsage = false
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"

@@ -5,7 +5,12 @@
 import os
 import sys
 from dotenv import load_dotenv
-from projectx_api import login_key, post_json
+
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, root_dir)
+sys.path.insert(0, os.path.join(root_dir, 'core'))
+
+from projectx_api import login_key, post_json  # type: ignore
 
 load_dotenv()
 

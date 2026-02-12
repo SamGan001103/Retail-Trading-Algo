@@ -1,11 +1,17 @@
-# order_cancel.py
+# positions_open.py
 # Usage:
-#   ACCOUNT_ID=18672085 ORDER_ID=2441409238 python order_cancel.py
+#   ACCOUNT_ID=18672085 python positions_open.py
 
 import os
 import sys
+import json
 from dotenv import load_dotenv
-from projectx_api import login_key, post_json
+
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, root_dir)
+sys.path.insert(0, os.path.join(root_dir, 'core'))
+
+from projectx_api import login_key, post_json  # type: ignore
 
 load_dotenv()
 
@@ -20,22 +26,31 @@ def main() -> int:
     username  = must_env("PROJECTX_USERNAME")
     api_key   = must_env("PROJECTX_API_KEY")
     account_id = int(must_env("ACCOUNT_ID"))
-    order_id   = int(must_env("ORDER_ID"))
 
     token = login_key(base_url, username, api_key)
 
     data = post_json(
         base_url=base_url,
         token=token,
-        path="/api/Order/cancel",
-        payload={"accountId": account_id, "orderId": order_id},
-        label="ORDER_CANCEL",
+        path="/api/Position/searchOpen",
+        payload={"accountId": account_id},
+        label="POSITION_SEARCH_OPEN",
     )
 
     if not data.get("success"):
         raise RuntimeError(data)
 
-    print("✅ Cancel request accepted:", data)
+    positions = data.get("positions") or []
+    print(f"✅ Open positions: {len(positions)}")
+    for p in positions[:50]:
+        print(json.dumps({
+            "contractId": p.get("contractId"),
+            "symbolId": p.get("symbolId"),
+            "netPos": p.get("netPos"),
+            "avgPrice": p.get("avgPrice"),
+            "unrealizedPnl": p.get("unrealizedPnl"),
+        }, indent=2))
+
     return 0
 
 if __name__ == "__main__":

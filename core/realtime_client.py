@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 from signalrcore.protocol.json_hub_protocol import JsonHubProtocol
 
-from projectx_api import login_key
+from projectx_api import login_key  # type: ignore
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -48,12 +48,12 @@ class JsonHubProtocolRS(JsonHubProtocol):
         super().__init__()
         self._buf = ""
 
-    def parse_messages(self, raw_message: str):
-        if not raw_message:
+    def parse_messages(self, raw: str):
+        if not raw:
             return []
 
         # Append to buffer (handles fragmented websocket payloads)
-        self._buf += raw_message
+        self._buf += raw
 
         # Split into complete frames; last part may be incomplete remainder
         parts = self._buf.split(self.RS)

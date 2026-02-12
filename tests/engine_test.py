@@ -3,9 +3,16 @@
 #   python engine_test.py
 
 import os
+import sys
 from dotenv import load_dotenv
-from execution_engine import ExecutionEngine
-from market_lookup import contract_search, must_get, login
+
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, root_dir)
+sys.path.insert(0, os.path.join(root_dir, 'core'))
+sys.path.insert(0, os.path.join(root_dir, 'market'))
+
+from execution_engine import ExecutionEngine  # type: ignore
+from market_lookup import contract_search, must_get, login  # type: ignore
 
 load_dotenv()
 
