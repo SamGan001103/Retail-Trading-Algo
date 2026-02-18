@@ -1,12 +1,15 @@
-from trading_algo.execution import engine_from_env
+from _common import load_runtime_and_broker
 
 
 def main() -> int:
-    _, engine = engine_from_env()
-    orders = engine.open_orders()
-    print(f"Open orders: {len(orders)}")
-    for order in orders[:50]:
-        print(order)
+    config, broker = load_runtime_and_broker()
+    try:
+        orders = broker.open_orders(config.account_id)
+        print(f"Open orders: {len(orders)}")
+        for order in orders[:50]:
+            print(order)
+    finally:
+        broker.close()
     return 0
 
 

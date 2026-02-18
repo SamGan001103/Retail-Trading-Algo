@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 
 from trading_algo.backtest import BacktestConfig, load_bars_from_csv, run_backtest as run_backtest_sim
-from trading_algo.config import RuntimeConfig, env_bool, env_int, load_runtime_config, must_env
+from trading_algo.config import RuntimeConfig, env_bool, env_float, load_runtime_config, must_env
 from trading_algo.ml import train_xgboost_from_csv
 from trading_algo.runtime.bot_runtime import run as run_forward_runtime
 from trading_algo.strategy import OneShotLongStrategy
@@ -36,6 +36,7 @@ def run_forward(config: RuntimeConfig) -> None:
     enabled = env_bool("BOT_ENABLED", False)
     environment = (os.getenv("TRADING_ENVIRONMENT") or "DEMO").strip()
     print(f"TRADING_ENVIRONMENT = {environment}")
+    print(f"BROKER             = {config.broker}")
     print(f"BOT_ENABLED        = {enabled}")
     print(f"SYMBOL             = {config.symbol}")
     print(f"ACCOUNT_ID         = {config.account_id}")
@@ -51,9 +52,9 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int) -> None:
     bars = load_bars_from_csv(data_csv)
     strategy = _strategy_from_name(strategy_name, hold_bars)
     cfg = BacktestConfig(
-        initial_cash=float(env_int("BACKTEST_INITIAL_CASH", 10_000)),
-        fee_per_order=float(env_int("BACKTEST_FEE_PER_ORDER", 1)),
-        slippage_bps=float(env_int("BACKTEST_SLIPPAGE_BPS", 1)),
+        initial_cash=env_float("BACKTEST_INITIAL_CASH", 10_000.0),
+        fee_per_order=env_float("BACKTEST_FEE_PER_ORDER", 1.0),
+        slippage_bps=env_float("BACKTEST_SLIPPAGE_BPS", 1.0),
     )
     result = run_backtest_sim(bars, strategy, cfg)
     print("BACKTEST RESULT")
@@ -61,6 +62,8 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int) -> None:
     print(f"final_equity={result.final_equity:.2f}")
     print(f"net_pnl={result.net_pnl:.2f} return_pct={result.total_return_pct:.2f}")
     print(f"win_rate_pct={result.win_rate_pct:.2f} max_drawdown_pct={result.max_drawdown_pct:.2f}")
+
+
 def run_train(data_csv: str, model_out: str) -> None:
     train_xgboost_from_csv(data_csv, model_out)
 

@@ -32,14 +32,22 @@ class ProjectXClient:
             print(f"[DEBUG] {label} body (first 800): {body[:800]!r}")
 
     def login_key(self, timeout: int = 30) -> str:
-        response = self._session.post(
-            f"{self.base_url}/api/Auth/loginKey",
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            json={"userName": self.username, "apiKey": self.api_key},
-            timeout=timeout,
-        )
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/Auth/loginKey",
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                json={"userName": self.username, "apiKey": self.api_key},
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Login request failed: {exc}") from exc
         self._debug_response(response, "LOGIN")
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Login returned non-JSON response: HTTP {response.status_code} {response.text[:300]}"
+            ) from exc
         if not data.get("success") or not data.get("token"):
             raise RuntimeError(f"Login failed: HTTP {response.status_code} {data}")
         return data["token"]
@@ -75,13 +83,19 @@ class ProjectXClient:
         if DEBUG_HTTP:
             print(f"[DEBUG] Sending payload to {path}: {payload}")
 
-        response = _request(self.token())
+        try:
+            response = _request(self.token())
+        except requests.RequestException as exc:
+            raise RuntimeError(f"{label} request failed: {exc}") from exc
         if response.status_code == 401:
             # Token may have expired early; refresh once and retry.
             with self._token_lock:
                 self._token_cache = None
                 self._token_expiry_ts = 0.0
-            response = _request(self.token())
+            try:
+                response = _request(self.token())
+            except requests.RequestException as exc:
+                raise RuntimeError(f"{label} retry request failed after auth refresh: {exc}") from exc
 
         self._debug_response(response, label)
         try:

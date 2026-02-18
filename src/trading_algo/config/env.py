@@ -19,6 +19,11 @@ def env_int(name: str, default: int) -> int:
     return int(raw) if raw else default
 
 
+def env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    return float(raw) if raw else default
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:

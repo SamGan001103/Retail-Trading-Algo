@@ -3,7 +3,9 @@
 __all__ = [
     "api",
     "backtest",
+    "broker",
     "config",
+    "core",
     "execution",
     "ml",
     "risk",

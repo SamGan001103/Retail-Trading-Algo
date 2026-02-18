@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from trading_algo.execution import BUY
+from trading_algo.core import BUY
 from trading_algo.strategy import MarketBar, PositionState, Strategy, StrategyContext
 
 
@@ -150,4 +150,3 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
         max_drawdown_pct=max_drawdown * 100.0,
         trades=trades,
     )
-

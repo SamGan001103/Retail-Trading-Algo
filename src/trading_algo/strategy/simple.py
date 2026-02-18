@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from trading_algo.execution import BUY
+from trading_algo.core import BUY
 from trading_algo.strategy.base import MarketBar, PositionState, Strategy, StrategyContext, StrategyDecision
 
 
@@ -37,4 +37,3 @@ class OneShotLongStrategy(Strategy):
             size=position.size if position.size > 0 else self.size,
             reason="hold",
         )
-

@@ -1,10 +1,13 @@
-from trading_algo.execution import engine_from_env
+from _common import load_runtime_and_broker
 
 
 def main() -> int:
-    _, engine = engine_from_env()
-    cancel_attempted, close_attempted = engine.flatten()
-    print(f"Flatten complete. cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
+    config, broker = load_runtime_and_broker()
+    try:
+        cancel_attempted, close_attempted = broker.flatten(config.account_id)
+        print(f"Flatten complete. cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
+    finally:
+        broker.close()
     return 0
 
 

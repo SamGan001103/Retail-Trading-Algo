@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
-from trading_algo.api import ProjectXClient
-
-BUY = 0
-SELL = 1
+from trading_algo.core import BUY, SELL
 
 
 @dataclass(frozen=True)
 class Brackets:
     sl_ticks: int
     tp_ticks: int
+
+
+class SupportsPostJson(Protocol):
+    def post_json(self, path: str, payload: dict[str, Any], label: str, timeout: int = 30) -> dict[str, Any]:
+        ...
 
 
 def sign_brackets(side: int, sl_abs: int, tp_abs: int) -> Brackets:
@@ -26,7 +28,7 @@ def sign_brackets(side: int, sl_abs: int, tp_abs: int) -> Brackets:
 
 
 class ExecutionEngine:
-    def __init__(self, client: ProjectXClient, account_id: int):
+    def __init__(self, client: SupportsPostJson, account_id: int):
         self.client = client
         self.account_id = int(account_id)
 

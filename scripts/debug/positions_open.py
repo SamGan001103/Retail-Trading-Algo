@@ -1,12 +1,15 @@
-from trading_algo.execution import engine_from_env
+from _common import load_runtime_and_broker
 
 
 def main() -> int:
-    _, engine = engine_from_env()
-    positions = engine.open_positions()
-    print(f"Open positions: {len(positions)}")
-    for position in positions[:50]:
-        print(position)
+    config, broker = load_runtime_and_broker()
+    try:
+        positions = broker.open_positions(config.account_id)
+        print(f"Open positions: {len(positions)}")
+        for position in positions[:50]:
+            print(position)
+    finally:
+        broker.close()
     return 0
 
 

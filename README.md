@@ -11,9 +11,11 @@ This README is the user instruction manual for running the algo in:
 ```text
 src/
   trading_algo/          # Core implementation
+    broker/              # Broker adapter boundary (current implementation: projectx)
+    core/                # Shared constants/types (broker-agnostic)
 scripts/
   execution/             # Main launchers
-  debug/                 # Debug/ops utilities
+  debug/                 # Debug/ops utilities (routed through broker adapter)
 tests/
 docs/
 ```
@@ -55,12 +57,13 @@ Select mode with `--mode`:
 ### Required for `forward` mode
 
 ```env
-PROJECTX_BASE_URL=https://...
-PROJECTX_USERNAME=...
-PROJECTX_API_KEY=...
+BROKER=projectx
+BROKER_BASE_URL=https://...
+BROKER_USERNAME=...
+BROKER_API_KEY=...
 ACCOUNT_ID=123456
-RTC_USER_HUB_URL=https://.../hubs/user
-RTC_MARKET_HUB_URL=https://.../hubs/market
+BROKER_USER_HUB_URL=https://.../hubs/user
+BROKER_MARKET_HUB_URL=https://.../hubs/market
 
 BOT_ENABLED=0
 TRADING_ENVIRONMENT=DEMO
@@ -77,13 +80,23 @@ FLATTEN_ON_START=false
 TRADE_ON_START=false
 ```
 
+Notes:
+
+- `BROKER` defaults to `projectx` if omitted.
+- `SIDE` accepts `0/1` and also `buy/sell` or `long/short`.
+- Preferred broker-neutral keys are `BROKER_*` and are used by runtime/config.
+- Current adapter implementation is `projectx`; broker abstraction is in `src/trading_algo/broker/`.
+- Legacy ProjectX keys are still accepted for backward compatibility:
+  - `PROJECTX_BASE_URL`, `PROJECTX_USERNAME`, `PROJECTX_API_KEY`
+  - `RTC_USER_HUB_URL`, `RTC_MARKET_HUB_URL`
+
 ### Optional for `backtest` mode
 
 ```env
 BACKTEST_DATA_CSV=data/ohlcv.csv
 BACKTEST_INITIAL_CASH=10000
-BACKTEST_FEE_PER_ORDER=1
-BACKTEST_SLIPPAGE_BPS=1
+BACKTEST_FEE_PER_ORDER=1.0
+BACKTEST_SLIPPAGE_BPS=1.0
 ```
 
 ## 5. Run Commands
@@ -98,6 +111,7 @@ Important:
 
 - `BOT_ENABLED=1` is required to actually run trading loop.
 - Keep `LIVE=false` unless you intentionally switch to live routing.
+- Forward runtime fails fast if realtime user/market streams do not connect at startup.
 
 ### B) Backtesting
 
@@ -151,6 +165,8 @@ python scripts/debug/flatten_all.py
 python scripts/debug/positions_open.py
 python scripts/debug/position_close_contract.py
 ```
+
+All debug scripts call the broker adapter interface, so the same commands are reusable across supported broker adapters.
 
 ## 8. Quick Safety Checklist
 
