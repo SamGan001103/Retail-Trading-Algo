@@ -15,6 +15,8 @@ src/
     runtime/
     telemetry/
 scripts/
+  execution/
+  debug/
 tests/
 docs/
 ```
@@ -38,22 +40,28 @@ pip install -e .
 ## Run
 
 ```bash
-python scripts/run_bot.py
+python scripts/execution/start_trading.py
 ```
 
-Other operational scripts:
+Master execution aliases:
 
 ```bash
-python scripts/bot.py
-python scripts/account_lookup.py
-python scripts/account_check.py
-python scripts/market_lookup.py
-python scripts/order_place.py
-python scripts/order_cancel.py
-python scripts/orders_open.py
-python scripts/flatten_all.py
-python scripts/positions_open.py
-python scripts/position_close_contract.py
+python scripts/execution/run_bot.py
+python scripts/execution/bot.py
+```
+
+Debug and ops scripts:
+
+```bash
+python scripts/debug/account_lookup.py
+python scripts/debug/account_check.py
+python scripts/debug/market_lookup.py
+python scripts/debug/order_place.py
+python scripts/debug/order_cancel.py
+python scripts/debug/orders_open.py
+python scripts/debug/flatten_all.py
+python scripts/debug/positions_open.py
+python scripts/debug/position_close_contract.py
 ```
 
 ## Test

@@ -17,3 +17,8 @@
 3. Start realtime subscriptions
 4. Run execution state loop
 5. Enforce bracket/risk safety, flatten on fault
+
+## Entrypoints
+
+- `scripts/execution/start_trading.py`: master launcher for bot runtime
+- `scripts/debug/`: operational debug scripts (lookups, order/position checks, flatten)
