@@ -1,7 +1,27 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "retail-trading-algo"
+version = "0.2.0"
+description = "Retail trading algorithm runtime and execution stack"
+requires-python = ">=3.11"
+dependencies = [
+  "python-dotenv",
+  "requests",
+  "signalrcore",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.pyright]
-pythonPath = "."
 pythonVersion = "3.11"
-include = ["."]
+include = ["src", "tests", "scripts"]
 exclude = [".venv", "__pycache__", ".git"]
 reportMissingImports = false
 reportMissingModuleSource = false
@@ -14,7 +34,3 @@ target-version = ["py311"]
 [tool.isort]
 profile = "black"
 line_length = 100
-
-[build-system]
-requires = ["setuptools>=65.0"]
-build-backend = "setuptools.build_meta"

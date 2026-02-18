@@ -1,31 +1,10 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 setup(
     name="retail-trading-algo",
-    version="0.1.0",
-    py_modules=[
-        "core.projectx_api",
-        "core.execution_engine",
-        "core.realtime_client",
-        "core.connect_gateway",
-        "bot.bot",
-        "bot.bot_runtime",
-        "account.account_check",
-        "account.account_lookup",
-        "orders.order_place",
-        "orders.order_cancel",
-        "orders.orders_open",
-        "positions.positions_open",
-        "positions.position_close_contract",
-        "positions.flatten_all",
-        "market.market_lookup",
-        "tests.engine_test",
-    ],
-    packages=find_packages(),
-    python_requires=">=3.8",
-    install_requires=[
-        "python-dotenv",
-        "requests",
-        "signalrcore",
-    ],
+    version="0.2.0",
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
+    python_requires=">=3.11",
+    install_requires=["python-dotenv", "requests", "signalrcore"],
 )
