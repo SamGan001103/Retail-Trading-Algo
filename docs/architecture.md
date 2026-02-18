@@ -20,5 +20,5 @@
 
 ## Entrypoints
 
-- `scripts/execution/start_trading.py`: master launcher for bot runtime
+- `scripts/execution/start_trading.py`: master launcher with `--mode forward|backtest|train`
 - `scripts/debug/`: operational debug scripts (lookups, order/position checks, flatten)
