@@ -275,3 +275,153 @@ Adaptation is allowed only inside predefined limits:
 3. Add a drift monitor job that evaluates rolling KPIs.
 4. Add promotion policy: challenger must beat champion in recent out-of-sample window with risk constraints.
 5. Integrate this loop into `train` + `forward` workflows incrementally.
+
+## 14. How To Find the Optimal Data/Parameter Size (Conversation Notes)
+
+If you're asking "how do I find the optimal amount of data (e.g., training window size / weighting)?" the only reliable answer in a drifting system (like markets) is:
+
+Empirically, with walk-forward experiments and stability criteria.
+
+Below is a clean engineering procedure to implement.
+
+### 1) Define what "optimal" means first
+
+Pick one primary objective, for example:
+
+- Net PnL
+- Sharpe / Sortino
+- AUC / logloss (for the ML layer)
+- Composite objective: `PnL - lambda * drawdown - mu * turnover`
+
+Also track stability metrics:
+
+- Performance variance across windows
+- Worst-case drawdown
+- Regime-to-regime consistency
+
+Do not optimize only mean performance. Optimize robust forward performance.
+
+### 2) Choose candidate data windows / weighting schemes
+
+Test a grid of plausible options, for example:
+
+Hard rolling windows:
+
+- 1 month
+- 3 months
+- 6 months
+- 12 months
+- 24 months
+
+Time-decay weighting:
+
+- Half-life = 1 month
+- Half-life = 3 months
+- Half-life = 6 months
+- Half-life = 12 months
+
+You can test both and compare.
+
+### 3) Use walk-forward evaluation (mandatory)
+
+For each candidate window/weighting:
+
+- Train on window `W`
+- Test on next period `H` (for example next week/month)
+- Slide forward:
+  - Train: `[t0 - W, t0]`
+  - Test: `(t0, t0 + H]`
+- Repeat over many folds
+
+Collect:
+
+- Mean performance
+- Standard deviation / downside risk
+- Worst fold performance
+- Stability across time
+
+Never use random splits.
+
+### 4) Score each option with a robust objective
+
+Do not just pick the highest average return.
+
+Use a robust score, for example:
+
+`Score = Mean - alpha * Std - beta * MaxDrawdown`
+
+Or use:
+
+- Median fold performance
+- 25th percentile fold performance
+- Percent of folds profitable
+
+This reduces overfitting to lucky windows.
+
+### 5) Look for the bias-variance tradeoff curve
+
+Common pattern:
+
+- Very short window: adapts fast, but noisy/unstable/overfit
+- Very long window: stable, but stale/slow to adapt
+- Middle window: best forward robustness
+
+Plot:
+
+- Window size vs performance
+- Window size vs variance/drawdown
+
+Pick the knee of the curve, not the extreme.
+
+### 6) Do this separately for each layer
+
+- ML layer (`feature -> label` mapping)
+- Rule layer parameters (thresholds, structure filters)
+- Optionally per regime
+
+It is normal for layers to prefer different windows.
+
+### 7) Add a meta-rule: re-optimize the window periodically
+
+Markets change, so re-run window selection every:
+
+- 3 months or 6 months
+
+Or trigger re-evaluation if live performance materially deviates from expected distribution.
+
+Adaptation itself must be adaptive.
+
+### 8) Fast starting heuristic (intraday futures)
+
+Start with rolling windows:
+
+- 1M, 3M, 6M, 12M
+
+Working prior:
+
+- ML layer often prefers 3-6 months
+- Rule calibration often prefers 6-12 months
+
+Then let walk-forward results decide.
+
+### 9) Key principle
+
+The "optimal" window is not universal.
+It is the one that gives the best forward stability, not the highest backtest peak.
+
+If you optimize for peak backtest, you will overfit the window itself.
+
+### 10) Inputs needed to make this concrete
+
+Provide:
+
+- Instrument + timeframe
+- Retraining frequency
+- Data volume per month
+- Main objective (PnL, Sharpe, AUC, etc.)
+
+Then define:
+
+- A specific window grid
+- A walk-forward scheme
+- A scoring function tailored to this system
