@@ -21,6 +21,7 @@ class RTState:
     positions: dict[int, dict[str, Any]]
     last_quote_by_contract: dict[str, dict[str, Any]]
     last_trade_by_contract: dict[str, dict[str, Any]]
+    last_depth_by_contract: dict[str, dict[str, Any]]
 
 
 class JsonHubProtocolRS(JsonHubProtocol):
@@ -59,7 +60,13 @@ class ProjectXRealtimeStream:
         self.user_hub_url = user_hub_url.rstrip("/")
         self.market_hub_url = market_hub_url.rstrip("/")
 
-        self._state = RTState(orders={}, positions={}, last_quote_by_contract={}, last_trade_by_contract={})
+        self._state = RTState(
+            orders={},
+            positions={},
+            last_quote_by_contract={},
+            last_trade_by_contract={},
+            last_depth_by_contract={},
+        )
         self._lock = threading.RLock()
         self._running = False
         self._contract_id: str | None = None
@@ -111,6 +118,12 @@ class ProjectXRealtimeStream:
         with self._lock:
             self._state.last_trade_by_contract[str(args[0])] = args[1]
 
+    def _on_depth(self, args: list[Any]) -> None:
+        if len(args) < 2 or not isinstance(args[1], dict):
+            return
+        with self._lock:
+            self._state.last_depth_by_contract[str(args[0])] = args[1]
+
     def start(self, contract_id: str) -> None:
         if self._running:
             return
@@ -154,6 +167,7 @@ class ProjectXRealtimeStream:
         self._user_conn.on("GatewayUserPosition", self._on_user_position)
         self._mkt_conn.on("GatewayQuote", self._on_quote)
         self._mkt_conn.on("GatewayTrade", self._on_trade)
+        self._mkt_conn.on("GatewayMarketDepth", self._on_depth)
         self._user_conn.start()
         self._mkt_conn.start()
 
@@ -209,3 +223,7 @@ class ProjectXRealtimeStream:
     def last_trade(self, contract_id: str) -> dict[str, Any] | None:
         with self._lock:
             return self._state.last_trade_by_contract.get(str(contract_id))
+
+    def last_depth(self, contract_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._state.last_depth_by_contract.get(str(contract_id))

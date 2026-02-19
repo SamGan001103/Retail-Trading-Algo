@@ -22,6 +22,9 @@ class BrokerStream(Protocol):
     def last_trade(self, contract_id: str) -> dict[str, Any] | None:
         ...
 
+    def last_depth(self, contract_id: str) -> dict[str, Any] | None:
+        ...
+
 
 class BrokerAdapter(Protocol):
     def resolve_contract_id(self, symbol: str, live: bool) -> str:

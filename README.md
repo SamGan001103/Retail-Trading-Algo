@@ -107,11 +107,27 @@ BACKTEST_SLIPPAGE_BPS=1.0
 python scripts/execution/start_trading.py --mode forward
 ```
 
+Run market-structure strategy in forward mode:
+
+```bash
+python scripts/execution/start_trading.py --mode forward --strategy ny_structure --hold-bars 120
+```
+
 Important:
 
 - `BOT_ENABLED=1` is required to actually run trading loop.
 - Keep `LIVE=false` unless you intentionally switch to live routing.
 - Forward runtime fails fast if realtime user/market streams do not connect at startup.
+- Forward strategy runtime builds bars from realtime stream (`STRAT_FORWARD_BAR_SEC`, default uses `LOOP_SEC`).
+- NY structure defaults to `STRAT_ENTRY_MODE=tick` in `forward` mode:
+  - setup environment is evaluated on completed bars
+  - ML gate evaluates setup candidates
+  - approved setups are executed by tick-level orderflow sniper logic
+- Streams remain subscribed continuously for bar-building and orderflow context.
+- Tick sniper evaluation runs only when a setup is armed (or while in-position), with adaptive polling cadence.
+- L2 orderflow gating stays adapter-routed:
+  - `STRAT_REQUIRE_ORDERFLOW=true` enables orderflow gate in strategy.
+  - `SUB_DEPTH=true` enables depth subscription on brokers that support it (ProjectX implemented).
 
 ### B) Backtesting
 
@@ -120,6 +136,50 @@ python scripts/execution/start_trading.py --mode backtest --data-csv data/ohlcv.
 ```
 
 You can also omit `--data-csv` if `BACKTEST_DATA_CSV` is set in `.env`.
+
+Market-structure strategy (NY session implementation):
+
+```bash
+python scripts/execution/start_trading.py --mode backtest --data-csv data/ohlcv.csv --strategy ny_structure --hold-bars 120
+```
+
+Optional strategy env knobs:
+
+```env
+STRAT_NY_SESSION_START=09:30
+STRAT_NY_SESSION_END=16:00
+STRAT_TZ_NAME=America/New_York
+STRAT_HTF_AGGREGATION=5
+STRAT_HTF_SWING_HIGH=5
+STRAT_HTF_SWING_LOW=5
+STRAT_LTF_SWING_HIGH=3
+STRAT_LTF_SWING_LOW=3
+STRAT_SWEEP_WICK_MIN=0.5
+STRAT_SWEEP_EXPIRY_BARS=40
+STRAT_EQUAL_LEVEL_TOL_BPS=8
+STRAT_KEY_AREA_TOL_BPS=12
+STRAT_MIN_CONFLUENCE=1
+STRAT_REQUIRE_ORDERFLOW=false
+STRAT_ENTRY_MODE=bar
+STRAT_TICK_SETUP_EXPIRY_BARS=3
+STRAT_TICK_HISTORY_SIZE=120
+STRAT_TICK_MIN_IMBALANCE=0.12
+STRAT_TICK_MIN_TRADE_SIZE=1.0
+STRAT_TICK_SPOOF_COLLAPSE=0.35
+STRAT_TICK_ABSORPTION_TRADES=2
+STRAT_TICK_ICEBERG_RELOADS=2
+STRAT_TICK_POLL_IDLE_SEC=0.25
+STRAT_TICK_POLL_ARMED_SEC=0.05
+STRAT_ML_GATE_ENABLED=false
+STRAT_ML_MODEL_PATH=artifacts/models/xgboost_model.json
+STRAT_ML_MIN_PROBA=0.55
+STRAT_ML_FAIL_OPEN=false
+```
+
+`STRAT_FORWARD_BAR_SEC` is used in `forward` mode for realtime bar aggregation and is not used by `backtest` mode.
+`STRAT_TICK_POLL_IDLE_SEC` controls forward tick polling when no setup is armed.
+`STRAT_TICK_POLL_ARMED_SEC` controls forward tick polling when setup is armed (or in-position).
+`STRAT_TICK_POLL_SEC` is a legacy/default fallback if the two explicit polling vars are not set.
 
 ### C) ML training scaffold (XGBoost)
 
@@ -194,7 +254,7 @@ Windows venv:
 
 - Good for infrastructure validation and forward testing.
 - Backtest/train are implemented as scaffolding and can be extended.
-- Strategy and risk logic are not final production alpha yet.
+- Strategy layer includes a working NY-session market-structure implementation plus tests, but it is not final production alpha yet.
 
 ## 11. Main Entry Summary
 
@@ -215,13 +275,13 @@ Use this as the master progress tracker.
 - [x] Step 3: Master mode switch in place (`forward`, `backtest`, `train`) via `scripts/execution/start_trading.py`.
 - [x] Step 4: Backtest scaffold implemented (CSV loader, basic simulator, PnL/return/win-rate/max-drawdown metrics).
 - [x] Step 5: ML training scaffold implemented (`train` mode + XGBoost trainer skeleton).
-- [ ] Step 6: Turn your trading strategy into code (clear entry/exit, invalidation, sizing, and session rules).
+- [x] Step 6: Turn your trading strategy into code (baseline NY-session market-structure and oneshot strategies implemented).
 - [ ] Step 7: Download and curate historical market data (clean OHLCV, session boundaries, symbol rollover handling).
 - [ ] Step 8: Backtest the coded strategy and log every trade candidate/outcome (market structure snapshot + result).
 - [ ] Step 9: Build a strategy-trade dataset from those logs (one row per candidate trade, with labels).
 - [ ] Step 10: Feature engineer the collected trade dataset (no leakage, consistent feature versions).
 - [ ] Step 11: Train and validate ML classifier (XGBoost) on historical strategy trades.
-- [ ] Step 12: Integrate ML gate into strategy runtime (strategy proposes trade, model approves/rejects).
+- [x] Step 12: Integrate baseline ML gate + orderflow sniper into strategy runtime (bar-based setup environment, ML gate, tick-level execution path).
 - [ ] Step 13: Upgrade backtest realism and validation (fees/slippage, walk-forward, out-of-sample checks).
 - [ ] Step 14: Harden risk and production controls (daily limits, cooldowns, kill-switch, monitoring and alerts).
 - [ ] Step 15: Forward test sign-off and staged live rollout (micro-size first, rollback plan ready).
@@ -233,10 +293,22 @@ Current focus:
 
 ## 13. Drift Concerns and Adaptive Plan (Working Notes)
 
-Current system is a 2-layer decision process:
+Target decision process is a 3-stage pipeline:
 
-1. `Strategy layer (rule-based)`: finds candidate setups (market structure + price action + orderflow).
-2. `ML layer`: classifies/regresses candidate quality to decide take/skip.
+1. `Setup environment layer (rule-based)`: validates candidate setup context from market structure.
+   For NY-session structure, candidate context includes:
+   - recent matching HTF sweep
+   - HTF bias not opposing trade direction
+   - continuation or CHoCH reversal
+   - confluence threshold met (equal levels / retracement / key area proximity)
+2. `ML gate layer`: scores the setup environment and decides take/skip.
+3. `Orderflow execution layer`: if ML approves, use orderflow/L2 concepts to snipe entry timing.
+
+Implementation status:
+
+- Setup environment logic is implemented in strategy code.
+- Baseline ML gate + tick-level orderflow sniper path is implemented in forward runtime.
+- Current sniper concepts are heuristic approximations (absorption/iceberg/spoofing/micro-timing) and should be calibrated with live data.
 
 Known drift risks:
 
