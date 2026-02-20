@@ -28,6 +28,11 @@ Windows venv:
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
+CLI scripts import `trading_algo` from the `src/` package path. Before running commands, use either:
+
+1. Editable install: `pip install -e .`
+2. Session PYTHONPATH override (PowerShell): `$env:PYTHONPATH="src"`
+
 ### 1.2 Configure `.env`
 
 Use this as the minimum runtime template:
@@ -62,6 +67,7 @@ NY structure + position management knobs used by current code:
 STRAT_ENTRY_MODE=tick
 STRAT_REQUIRE_ORDERFLOW=false
 STRAT_FORWARD_BAR_SEC=1
+STRAT_TICK_POLL_SEC=0.25
 STRAT_TICK_POLL_IDLE_SEC=0.25
 STRAT_TICK_POLL_ARMED_SEC=0.05
 SUB_DEPTH=true
@@ -126,8 +132,25 @@ Notes:
 2. `SIDE` accepts `0/1` and `buy/sell` or `long/short`.
 3. Use `.env.example` as the baseline and keep real credentials only in local `.env`.
 4. Mode-focused templates are available: `.env.forward.example`, `.env.backtest.example`, `.env.train.example`.
+5. `STRAT_ENTRY_MODE` defaults to `tick` in `forward` mode and `bar` in `backtest` mode unless explicitly set.
+6. `STRAT_TICK_POLL_SEC` is the base fallback poll interval; idle/armed values can override it.
 
 ### 1.3 Run Commands
+
+CLI flags (`python scripts/execution/start_trading.py --help`):
+
+```bash
+--mode {forward,backtest,train}
+--data-csv DATA_CSV
+--strategy STRATEGY
+--model-out MODEL_OUT
+--hold-bars HOLD_BARS
+```
+
+Accepted strategy aliases:
+
+1. `oneshot`, `one_shot`, `one-shot`
+2. `ny_structure`, `ny_session`, `market_structure`, `mnq_ny`
 
 Forward:
 
@@ -169,6 +192,12 @@ python scripts/debug/position_close_contract.py
 4. Start with `SIZE=1`.
 5. Confirm both `STRAT_ACCOUNT_MAX_DRAWDOWN` and `ACCOUNT_MAX_DRAWDOWN_KILLSWITCH` before enabling.
 
+### 1.6 Verification
+
+```bash
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
 ## 2. Pipeline
 
 ### 2.1 Mode Pipeline
@@ -191,22 +220,29 @@ python scripts/debug/position_close_contract.py
 
 ### 2.2 NY Structure Decision Pipeline
 
-1. Completed-bar setup environment
+1. Module responsibilities
+   - `swing_points.py`: stateful HTF/LTF swing detection and snapshots
+   - `liquidity_sweep.py`: HTF aggregation, wick-sweep detection, sweep freshness
+   - `structure_signals.py`: HTF bias, LTF trend, CHoCH, confluence checks
+   - `orderflow.py`: depth imbalance filtering, DOM liquidity levels, tick micro-timing/exhaustion
+   - `ny_session_structure.py`: orchestration across setup, gating, sizing, and execution
+2. Completed-bar setup environment
    - recent matching HTF sweep
    - HTF bias not opposing side
    - continuation or CHoCH reversal
    - confluence threshold met
-2. ML gate scores setup and approves/rejects
-3. Position management planning
+3. ML gate scores setup and approves/rejects
+4. Position management planning
    - stop-loss level/ticks
    - take-profit level/ticks
    - contract sizing with risk cap and ML scaling
-4. Execution
+5. Execution
    - `entry_mode=bar`: place immediately
-   - `entry_mode=tick`: arm setup, wait for tick-level orderflow timing
-5. Runtime safeguards
+   - `entry_mode=tick`: arm setup, wait for `tick_entry_ready(...)` micro-timing
+6. Runtime safeguards
    - position/order count limits
    - drawdown guard (halt + flatten on breach)
+   - optional in-position exhaustion market exit (`tick_exhaustion_exit_signal(...)`)
 
 ### 2.3 Risk and Execution Behavior
 
@@ -317,9 +353,12 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/strategy/__init__.py` | Strategy exports. | Base types + concrete strategy exports. |
 | `src/trading_algo/strategy/base.py` | Strategy interfaces/types. | `StrategyDecision`, `MarketBar`, `PositionState`, protocol. |
 | `src/trading_algo/strategy/simple.py` | Minimal sample strategy. | One-shot long strategy for baseline testing. |
-| `src/trading_algo/strategy/market_structure/__init__.py` | Market-structure exports. | NY strategy and swing/orderflow support exports. |
-| `src/trading_algo/strategy/market_structure/swing_points.py` | Swing detection utilities. | Swing levels, snapshots, multi-timeframe helpers. |
-| `src/trading_algo/strategy/market_structure/ny_session_structure.py` | Main NY session strategy. | Setup environment, ML gate, risk planning, tick sniper path. |
+| `src/trading_algo/strategy/market_structure/__init__.py` | Market-structure package exports. | Re-exports NY strategy plus sweep/swing/orderflow primitives. |
+| `src/trading_algo/strategy/market_structure/liquidity_sweep.py` | HTF sweep utilities. | HTF bar aggregation, wick sweep detection, sweep freshness checks. |
+| `src/trading_algo/strategy/market_structure/orderflow.py` | Orderflow/tick microstructure utilities. | Depth imbalance filter, DOM liquidity extraction, tick entry/exhaustion signals. |
+| `src/trading_algo/strategy/market_structure/structure_signals.py` | Structure signal helpers. | LTF trend, HTF bias, CHoCH, equal-level/fib/key-area confluence checks. |
+| `src/trading_algo/strategy/market_structure/swing_points.py` | Stateful swing-point detectors. | Swing level lifecycle, snapshots, multi-timeframe wrapper. |
+| `src/trading_algo/strategy/market_structure/ny_session_structure.py` | Orchestrating NY session strategy. | Setup assembly, ML gate, SL/TP planning, risk sizing, bar/tick execution control. |
 | `src/trading_algo/telemetry/__init__.py` | Telemetry exports. | Logger helper exports. |
 | `src/trading_algo/telemetry/logging.py` | Logging helper. | Logger factory and shared logging defaults. |
 | `tests/__init__.py` | Test package marker. | Enables package-style test imports. |
