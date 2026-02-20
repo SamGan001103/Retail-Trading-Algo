@@ -4,7 +4,7 @@ from collections import deque
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from trading_algo.core import BUY, SELL
@@ -201,6 +201,7 @@ class NYSessionMarketStructureStrategy(Strategy):
     _orderflow_state: OrderFlowState = field(default_factory=OrderFlowState, init=False, repr=False)
     _pending_setup: PlannedEntry | None = field(default=None, init=False, repr=False)
     _tick_samples: deque[TickFlowSample] = field(init=False, repr=False)
+    _candidate_events: deque[dict[str, Any]] = field(init=False, repr=False)
     _ml_gate: SetupApprovalGate | None = field(default=None, init=False, repr=False)
     _stop_planner: StopLossPlanner = field(init=False, repr=False)
     _take_profit_planner: TakeProfitPlanner = field(init=False, repr=False)
@@ -267,6 +268,7 @@ class NYSessionMarketStructureStrategy(Strategy):
                 DepthImbalanceOrderFlowFilter() if self.require_orderflow else AllowAllOrderFlowFilter()
             )
         self._tick_samples = deque(maxlen=self.tick_history_size)
+        self._candidate_events = deque(maxlen=4_000)
         self._stop_planner = StopLossPlanner(
             tick_size=self.tick_size,
             noise_buffer_ticks=self.sl_noise_buffer_ticks,
@@ -290,6 +292,11 @@ class NYSessionMarketStructureStrategy(Strategy):
         if self._pending_setup is None:
             return None
         return self._pending_setup.setup
+
+    def drain_candidate_events(self) -> list[dict[str, Any]]:
+        events = list(self._candidate_events)
+        self._candidate_events.clear()
+        return events
 
     def is_in_session(self, ts: str) -> bool:
         return self._session.contains(ts)
@@ -369,6 +376,8 @@ class NYSessionMarketStructureStrategy(Strategy):
 
         if long_ready == short_ready:
             if long_ready:
+                self._emit_candidate_event(long_setup, status="rejected", reason="ambiguous-dual-signal")
+                self._emit_candidate_event(short_setup, status="rejected", reason="ambiguous-dual-signal")
                 self._pending_setup = None
             return StrategyDecision(
                 should_exit=False,
@@ -379,9 +388,11 @@ class NYSessionMarketStructureStrategy(Strategy):
             )
 
         chosen = long_setup if long_ready else short_setup
+        self._emit_candidate_event(chosen, status="detected", reason="setup-ready")
         ml_decision = self._evaluate_ml(chosen)
         if not ml_decision.approved:
             self._pending_setup = None
+            self._emit_candidate_event(chosen, status="rejected", reason=f"ml-reject:{ml_decision.reason}")
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
@@ -392,6 +403,7 @@ class NYSessionMarketStructureStrategy(Strategy):
         entry_plan = self._build_entry_risk_plan(chosen, ml_score=ml_decision.score)
         if entry_plan is None:
             self._pending_setup = None
+            self._emit_candidate_event(chosen, status="rejected", reason="risk-invalid")
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
@@ -402,6 +414,7 @@ class NYSessionMarketStructureStrategy(Strategy):
 
         if self.entry_mode == "tick":
             self._pending_setup = entry_plan
+            self._emit_candidate_event(entry_plan.setup, status="armed", reason="tick-entry-mode")
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
@@ -417,6 +430,7 @@ class NYSessionMarketStructureStrategy(Strategy):
                 context=context,
                 flow=self._orderflow_state,
             ):
+                self._emit_candidate_event(entry_plan.setup, status="rejected", reason="orderflow-gate")
                 return StrategyDecision(
                     should_exit=False,
                     should_enter=False,
@@ -425,6 +439,7 @@ class NYSessionMarketStructureStrategy(Strategy):
                     reason="flat-orderflow-gate",
                 )
 
+        self._emit_candidate_event(entry_plan.setup, status="entered", reason="entry-ny-structure-bar")
         return StrategyDecision(
             should_exit=False,
             should_enter=True,
@@ -476,6 +491,7 @@ class NYSessionMarketStructureStrategy(Strategy):
                 reason="tick-no-setup",
             )
         if not self._session.contains(ts):
+            self._emit_candidate_event(planned.setup, status="invalidated", reason="outside-session")
             self._pending_setup = None
             return StrategyDecision(
                 should_exit=False,
@@ -502,6 +518,7 @@ class NYSessionMarketStructureStrategy(Strategy):
                 context=context,
                 flow=self._orderflow_state,
             ):
+                self._emit_candidate_event(planned.setup, status="rejected", reason="tick-orderflow-gate")
                 return StrategyDecision(
                     should_exit=False,
                     should_enter=False,
@@ -520,6 +537,7 @@ class NYSessionMarketStructureStrategy(Strategy):
 
         refreshed_plan = self._build_entry_risk_plan(planned.setup, ml_score=planned.ml_score, entry_price=price)
         if refreshed_plan is None:
+            self._emit_candidate_event(planned.setup, status="invalidated", reason="tick-risk-invalidated")
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
@@ -529,6 +547,7 @@ class NYSessionMarketStructureStrategy(Strategy):
             )
 
         self._pending_setup = None
+        self._emit_candidate_event(refreshed_plan.setup, status="entered", reason="entry-orderflow-sniper")
         return StrategyDecision(
             should_exit=False,
             should_enter=True,
@@ -724,7 +743,39 @@ class NYSessionMarketStructureStrategy(Strategy):
         if self._pending_setup is None:
             return
         if (bar_index - self._pending_setup.setup.index) > self.tick_setup_expiry_bars:
+            self._emit_candidate_event(self._pending_setup.setup, status="expired", reason="tick-setup-expiry")
             self._pending_setup = None
+
+    @staticmethod
+    def _side_name(side: int) -> str:
+        return "buy" if side == BUY else "sell"
+
+    @staticmethod
+    def _candidate_id(setup: SetupEnvironment) -> str:
+        side = "buy" if setup.side == BUY else "sell"
+        return f"{setup.ts}:{setup.index}:{side}"
+
+    def _emit_candidate_event(self, setup: SetupEnvironment, *, status: str, reason: str) -> None:
+        self._candidate_events.append(
+            {
+                "candidate_id": self._candidate_id(setup),
+                "status": status,
+                "reason": reason,
+                "side": self._side_name(setup.side),
+                "setup_index": setup.index,
+                "setup_ts": setup.ts,
+                "setup_close": setup.close,
+                "has_recent_sweep": setup.has_recent_sweep,
+                "htf_bias": setup.htf_bias,
+                "bias_ok": setup.bias_ok,
+                "continuation": setup.continuation,
+                "reversal": setup.reversal,
+                "equal_levels": setup.equal_levels,
+                "fib_retracement": setup.fib_retracement,
+                "key_area_proximity": setup.key_area_proximity,
+                "confluence_score": setup.confluence_score,
+            }
+        )
 
     def _record_tick_sample(self, ts: str, price: float) -> None:
         try:

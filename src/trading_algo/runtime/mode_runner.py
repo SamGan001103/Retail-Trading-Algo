@@ -8,6 +8,7 @@ from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, get
 from trading_algo.ml import SetupMLGate, train_xgboost_from_csv
 from trading_algo.runtime.bot_runtime import run as run_forward_runtime
 from trading_algo.strategy import NYSessionMarketStructureStrategy, OneShotLongStrategy
+from trading_algo.telemetry import TelemetryRouter
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,22 @@ class ModeOptions:
     strategy: str
     model_out: str
     hold_bars: int
+    profile: str | None = None
+
+
+def _resolve_profile(explicit: str | None) -> str:
+    raw = (explicit or os.getenv("RUNTIME_PROFILE") or "normal").strip().lower()
+    if raw in {"debug", "dbg"}:
+        return "debug"
+    return "normal"
+
+
+def _strategy_side_name(side: int | None) -> str:
+    if side == 0:
+        return "buy"
+    if side == 1:
+        return "sell"
+    return "unknown"
 
 
 def _strategy_from_name(name: str, hold_bars: int, *, for_forward: bool):
@@ -88,12 +105,14 @@ def _resolve_data_csv(explicit: str | None) -> str:
     return must_env("BACKTEST_DATA_CSV")
 
 
-def run_forward(config: RuntimeConfig, strategy_name: str, hold_bars: int) -> None:
+def run_forward(config: RuntimeConfig, strategy_name: str, hold_bars: int, profile: str) -> None:
     enabled = env_bool("BOT_ENABLED", False)
     environment = (os.getenv("TRADING_ENVIRONMENT") or "DEMO").strip()
     strategy = _strategy_from_name(strategy_name, hold_bars, for_forward=True)
+    telemetry = TelemetryRouter.from_env(profile=profile, mode="forward", strategy=strategy_name)
     print(f"TRADING_ENVIRONMENT = {environment}")
     print(f"BROKER             = {config.broker}")
+    print(f"RUNTIME_PROFILE    = {profile}")
     print(f"BOT_ENABLED        = {enabled}")
     print(f"SYMBOL             = {config.symbol}")
     print(f"ACCOUNT_ID         = {config.account_id}")
@@ -103,23 +122,56 @@ def run_forward(config: RuntimeConfig, strategy_name: str, hold_bars: int) -> No
     if not enabled:
         print("BOT_ENABLED=0 -> Trading disabled.")
         return
-    run_forward_runtime(config, strategy=strategy)
+    run_forward_runtime(config, strategy=strategy, profile=profile, telemetry=telemetry)
 
 
-def run_backtest(data_csv: str, strategy_name: str, hold_bars: int) -> None:
+def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str) -> None:
     bars = load_bars_from_csv(data_csv)
     strategy = _strategy_from_name(strategy_name, hold_bars, for_forward=False)
+    telemetry = TelemetryRouter.from_env(profile=profile, mode="backtest", strategy=strategy_name)
     symbol = (os.getenv("SYMBOL") or "MNQ").strip().upper()
-    profile = get_symbol_profile(symbol)
+    symbol_profile = get_symbol_profile(symbol)
     max_drawdown_abs = env_float("ACCOUNT_MAX_DRAWDOWN_KILLSWITCH", env_float("ACCOUNT_MAX_DRAWDOWN", 0.0))
     cfg = BacktestConfig(
         initial_cash=env_float("BACKTEST_INITIAL_CASH", 10_000.0),
         fee_per_order=env_float("BACKTEST_FEE_PER_ORDER", 1.0),
         slippage_bps=env_float("BACKTEST_SLIPPAGE_BPS", 1.0),
-        tick_size=env_float("STRAT_TICK_SIZE", profile.tick_size),
+        tick_size=env_float("STRAT_TICK_SIZE", symbol_profile.tick_size),
         max_drawdown_abs=max_drawdown_abs if max_drawdown_abs > 0 else None,
     )
-    result = run_backtest_sim(bars, strategy, cfg)
+    result = run_backtest_sim(
+        bars,
+        strategy,
+        cfg,
+        telemetry_callback=lambda event: telemetry.emit_performance(event),
+        execution_callback=lambda event: telemetry.emit_execution(event),
+        candidate_callback=lambda event: telemetry.emit_candidate(event),
+    )
+    telemetry.emit_performance(
+        {
+            "event_name": "backtest_summary",
+            "bars": len(bars),
+            "num_trades": result.num_trades,
+            "final_equity": round(result.final_equity, 6),
+            "net_pnl": round(result.net_pnl, 6),
+            "return_pct": round(result.total_return_pct, 6),
+            "win_rate_pct": round(result.win_rate_pct, 6),
+            "max_drawdown_pct": round(result.max_drawdown_pct, 6),
+        }
+    )
+    for trade in result.trades:
+        telemetry.emit_execution(
+            {
+                "event_name": "backtest_trade",
+                "entry_ts": trade.entry_ts,
+                "exit_ts": trade.exit_ts,
+                "side": _strategy_side_name(trade.side),
+                "size": trade.size,
+                "entry_price": round(trade.entry_price, 6),
+                "exit_price": round(trade.exit_price, 6),
+                "pnl": round(trade.pnl, 6),
+            }
+        )
     print("BACKTEST RESULT")
     print(f"bars={len(bars)} trades={result.num_trades}")
     print(f"final_equity={result.final_equity:.2f}")
@@ -133,13 +185,14 @@ def run_train(data_csv: str, model_out: str) -> None:
 
 def run_mode(options: ModeOptions) -> None:
     mode = options.mode.strip().lower()
+    profile = _resolve_profile(options.profile)
     if mode == "forward":
-        run_forward(load_runtime_config(), options.strategy, options.hold_bars)
+        run_forward(load_runtime_config(), options.strategy, options.hold_bars, profile)
         return
 
     data_csv = _resolve_data_csv(options.data_csv)
     if mode == "backtest":
-        run_backtest(data_csv, options.strategy, options.hold_bars)
+        run_backtest(data_csv, options.strategy, options.hold_bars, profile)
         return
     if mode == "train":
         run_train(data_csv, options.model_out)

@@ -79,6 +79,12 @@ STRAT_TICK_POLL_IDLE_SEC=0.25
 STRAT_TICK_POLL_ARMED_SEC=0.05
 SUB_DEPTH=true
 
+RUNTIME_PROFILE=normal
+TELEMETRY_DIR=artifacts/telemetry
+TELEMETRY_CANDIDATES_FILE=candidate_trades.jsonl
+TELEMETRY_PERF_FILE=performance.jsonl
+DEBUG_TICK_TRACE_EVERY_N=20
+
 STRAT_NY_SESSION_START=09:30
 STRAT_NY_SESSION_END=16:00
 STRAT_TZ_NAME=America/New_York
@@ -148,6 +154,7 @@ CLI flags (`python scripts/execution/start_trading.py --help`):
 
 ```bash
 --mode {forward,backtest,train}
+--profile {normal,debug}
 --data-csv DATA_CSV
 --strategy STRATEGY
 --model-out MODEL_OUT
@@ -165,6 +172,12 @@ Forward:
 
 ```bash
 python scripts/execution/start_trading.py --mode forward --strategy ny_structure --hold-bars 120
+```
+
+Forward (`debug` profile for step-by-step strategy tracing):
+
+```bash
+python scripts/execution/start_trading.py --mode forward --profile debug --strategy ny_structure --hold-bars 120
 ```
 
 Backtest:
@@ -200,12 +213,19 @@ python scripts/debug/position_close_contract.py
 3. Keep `LIVE=false` until forward testing sign-off.
 4. Start with `SIZE=1`.
 5. Confirm both `STRAT_ACCOUNT_MAX_DRAWDOWN` and `ACCOUNT_MAX_DRAWDOWN_KILLSWITCH` before enabling.
+6. Use `RUNTIME_PROFILE=normal` for cleaner output and lower runtime overhead.
+7. Use `RUNTIME_PROFILE=debug` when you need strategy-process visualization and trace logs.
 
 ### 1.6 Verification
 
 ```bash
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+Telemetry output files (JSONL append):
+
+1. Candidate trades: `artifacts/telemetry/candidate_trades.jsonl`
+2. Performance/execution: `artifacts/telemetry/performance.jsonl`
 
 ### 1.7 Troubleshooting
 
@@ -220,15 +240,19 @@ If you see `ModuleNotFoundError: No module named 'trading_algo'`:
 
 1. `forward`
    - Load runtime config
+   - Resolve runtime profile (`normal`/`debug`) from `--profile` or `RUNTIME_PROFILE`
+   - Initialize telemetry append sinks (candidate + performance JSONL)
    - Build broker adapter
    - Resolve contract
    - Start realtime streams
    - Run strategy loop (bar build + optional tick execution)
+   - `debug` profile prints strategy-process traces; `normal` stays concise
 2. `backtest`
    - Load CSV bars
    - Instantiate strategy
    - Simulate entries/exits with slippage/fees
    - Simulate bracket SL/TP hits from OHLC bars
+   - Emit candidate/performance/execution telemetry via callback hooks
 3. `train`
    - Build feature matrix from CSV
    - Train XGBoost model
@@ -339,7 +363,7 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/api/factory.py` | API client factory from env. | Env loading and `ProjectXClient` construction. |
 | `src/trading_algo/backtest/__init__.py` | Backtest exports. | CSV loader + backtest engine symbols. |
 | `src/trading_algo/backtest/data.py` | Historical CSV parsing. | Column alias handling and `MarketBar` conversion. |
-| `src/trading_algo/backtest/engine.py` | Backtest simulator. | Slippage/fees, bracket SL/TP checks, drawdown halt, metrics. |
+| `src/trading_algo/backtest/engine.py` | Backtest simulator. | Slippage/fees, bracket SL/TP checks, drawdown halt, metrics, telemetry callback hooks. |
 | `src/trading_algo/broker/__init__.py` | Broker layer exports. | Adapter interfaces and ProjectX adapter exports. |
 | `src/trading_algo/broker/base.py` | Broker protocol contracts. | `BrokerAdapter` and stream protocol signatures. |
 | `src/trading_algo/broker/factory.py` | Broker adapter factory. | Runtime config -> concrete adapter selection. |
@@ -362,9 +386,9 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/position_management/stop_loss.py` | Stop-loss planner. | Invalidation-level stop selection and noise buffer logic. |
 | `src/trading_algo/position_management/take_profit.py` | Take-profit planner. | RRR-filtered target selection and median valid target logic. |
 | `src/trading_algo/runtime/__init__.py` | Runtime exports. | Mode runner, main runtime entry, drawdown guard exports. |
-| `src/trading_algo/runtime/bot_runtime.py` | Main forward runtime loop. | Stream polling, bar build, tick handling, order placement, guards. |
+| `src/trading_algo/runtime/bot_runtime.py` | Main forward runtime loop. | Stream polling, bar build, tick handling, order placement, guards, profile-aware runtime tracing, telemetry emission. |
 | `src/trading_algo/runtime/drawdown_guard.py` | Runtime drawdown tracker/kill-switch helper. | Realized/unrealized PnL tracking and breach signaling. |
-| `src/trading_algo/runtime/mode_runner.py` | Mode orchestrator. | Strategy factory, forward/backtest/train dispatch, env wiring. |
+| `src/trading_algo/runtime/mode_runner.py` | Mode orchestrator. | Strategy factory, forward/backtest/train dispatch, profile resolution, telemetry wiring. |
 | `src/trading_algo/runtime/realtime_client.py` | Compatibility shim for legacy imports. | Alias to `ProjectXRealtimeStream`. |
 | `src/trading_algo/strategy/__init__.py` | Strategy exports. | Base types + concrete strategy exports. |
 | `src/trading_algo/strategy/base.py` | Strategy interfaces/types. | `StrategyDecision`, `MarketBar`, `PositionState`, protocol. |
@@ -375,8 +399,9 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/strategy/market_structure/structure_signals.py` | Structure signal helpers. | LTF trend, HTF bias, CHoCH, equal-level/fib/key-area confluence checks, typed detector protocols. |
 | `src/trading_algo/strategy/market_structure/swing_points.py` | Stateful swing-point detectors. | Swing level lifecycle, snapshots, multi-timeframe wrapper. |
 | `src/trading_algo/strategy/market_structure/ny_session_structure.py` | Orchestrating NY session strategy. | Setup assembly, ML gate, SL/TP planning, risk sizing, bar/tick execution control. |
-| `src/trading_algo/telemetry/__init__.py` | Telemetry exports. | Logger helper exports. |
+| `src/trading_algo/telemetry/__init__.py` | Telemetry exports. | Logger + telemetry router exports. |
 | `src/trading_algo/telemetry/logging.py` | Logging helper. | Logger factory and shared logging defaults. |
+| `src/trading_algo/telemetry/pipeline.py` | Telemetry router/sinks. | Profile-aware console trace + JSONL append pipeline for candidate/performance/execution events. |
 | `tests/__init__.py` | Test package marker. | Enables package-style test imports. |
 | `tests/test_backtest.py` | Backtest behavior tests. | CSV load, one-shot run, bracket simulation, drawdown halt tests. |
 | `tests/test_broker_factory.py` | Broker factory tests. | Env-based adapter construction checks. |
@@ -385,7 +410,7 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `tests/test_execution_engine.py` | Execution engine tests. | Bracket sign rules, payload checks, entry eligibility checks. |
 | `tests/test_imports.py` | Import smoke tests. | Public module import validation. |
 | `tests/test_ml_gate.py` | ML gate unit tests. | Disabled/fail-closed gate behavior checks. |
-| `tests/test_ny_session_structure_strategy.py` | NY strategy tests. | Session checks, setup arming, tick entry, ML rejection behavior. |
+| `tests/test_ny_session_structure_strategy.py` | NY strategy tests. | Session checks, setup arming, tick entry, ML rejection behavior, candidate-event emission checks. |
 | `tests/test_orderflow_filter.py` | Orderflow filter tests. | Depth imbalance extraction and long/short gating checks. |
 | `tests/test_position_management_planners.py` | SL/TP planner tests. | Stop planner, RRR filter, median target selection tests. |
 | `tests/test_swing_points.py` | Swing detection tests. | Current/past swing transitions and swept-level behavior. |

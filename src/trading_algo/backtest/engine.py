@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Callable
 
 from trading_algo.core import BUY
 from trading_algo.strategy import MarketBar, PositionState, Strategy, StrategyContext
@@ -105,7 +106,40 @@ def _protective_exit_price(
     return None
 
 
-def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConfig) -> BacktestResult:
+def _strategy_side_name(side: int | None) -> str:
+    if side == 0:
+        return "buy"
+    if side == 1:
+        return "sell"
+    return "unknown"
+
+
+def _drain_candidate_events(strategy: Strategy) -> list[dict[str, Any]]:
+    drain = getattr(strategy, "drain_candidate_events", None)
+    if not callable(drain):
+        return []
+    try:
+        events = drain()
+    except Exception:
+        return []
+    if not isinstance(events, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for event in events:
+        if isinstance(event, dict):
+            out.append(event)
+    return out
+
+
+def run_backtest(
+    bars: list[MarketBar],
+    strategy: Strategy,
+    config: BacktestConfig,
+    *,
+    telemetry_callback: Callable[[dict[str, Any]], None] | None = None,
+    execution_callback: Callable[[dict[str, Any]], None] | None = None,
+    candidate_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> BacktestResult:
     cash = float(config.initial_cash)
     equity = cash
     peak_equity = equity
@@ -127,6 +161,8 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
             protective = _protective_exit_price(side, bar, sl_price, tp_price)
             if protective is not None:
                 protective_price, _reason = protective
+                exit_side = side
+                exit_size = size
                 exit_price = _apply_slippage(protective_price, side, config.slippage_bps, is_entry=False)
                 pnl = _trade_pnl(side, size, entry_price, exit_price, config.fee_per_order)
                 cash += pnl
@@ -158,6 +194,19 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
                 if config.max_drawdown_abs is not None and config.max_drawdown_abs > 0:
                     if (peak_equity - equity) >= config.max_drawdown_abs:
                         trading_halted = True
+                if execution_callback is not None:
+                    execution_callback(
+                        {
+                            "event_name": "protective_exit",
+                            "bar_index": idx,
+                            "bar_ts": bar.ts,
+                            "side": _strategy_side_name(exit_side),
+                            "size": exit_size,
+                            "reason": _reason,
+                            "exit_price": round(exit_price, 6),
+                            "pnl": round(pnl, 6),
+                        }
+                    )
 
         if trading_halted:
             continue
@@ -171,6 +220,15 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
             bars_in_position=bars_in_position if in_position else 0,
         )
         decision = strategy.on_bar(bar, context, position)
+        for candidate_event in _drain_candidate_events(strategy):
+            if candidate_callback is not None:
+                event = {
+                    "event_name": "strategy_candidate",
+                    "bar_index": idx,
+                    "bar_ts": bar.ts,
+                }
+                event.update(candidate_event)
+                candidate_callback(event)
 
         if not in_position and decision.should_enter:
             side = decision.side
@@ -186,7 +244,23 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
                 tp_ticks_abs=decision.tp_ticks_abs,
                 tick_size=config.tick_size,
             )
+            if execution_callback is not None:
+                execution_callback(
+                    {
+                        "event_name": "enter",
+                        "bar_index": idx,
+                        "bar_ts": bar.ts,
+                        "side": _strategy_side_name(side),
+                        "size": size,
+                        "reason": decision.reason,
+                        "entry_price": round(entry_price, 6),
+                        "sl_ticks_abs": int(decision.sl_ticks_abs) if decision.sl_ticks_abs else None,
+                        "tp_ticks_abs": int(decision.tp_ticks_abs) if decision.tp_ticks_abs else None,
+                    }
+                )
         elif in_position and decision.should_exit and side is not None:
+            exit_side = side
+            exit_size = size
             exit_price = _apply_slippage(bar.close, side, config.slippage_bps, is_entry=False)
             pnl = _trade_pnl(side, size, entry_price, exit_price, config.fee_per_order)
             cash += pnl
@@ -209,6 +283,19 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
             bars_in_position = 0
             sl_price = None
             tp_price = None
+            if execution_callback is not None:
+                execution_callback(
+                    {
+                        "event_name": "exit",
+                        "bar_index": idx,
+                        "bar_ts": bar.ts,
+                        "side": _strategy_side_name(exit_side),
+                        "size": exit_size,
+                        "reason": decision.reason,
+                        "exit_price": round(exit_price, 6),
+                        "pnl": round(pnl, 6),
+                    }
+                )
         elif in_position:
             bars_in_position += 1
 
@@ -226,6 +313,8 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
             if (peak_equity - equity) >= config.max_drawdown_abs:
                 trading_halted = True
                 if in_position and side is not None:
+                    exit_side = side
+                    exit_size = size
                     exit_price = _apply_slippage(bar.close, side, config.slippage_bps, is_entry=False)
                     pnl = _trade_pnl(side, size, entry_price, exit_price, config.fee_per_order)
                     cash += pnl
@@ -249,9 +338,41 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
                     sl_price = None
                     tp_price = None
                     equity = cash
+                    if execution_callback is not None:
+                        execution_callback(
+                            {
+                                "event_name": "halt_exit",
+                                "bar_index": idx,
+                                "bar_ts": bar.ts,
+                                "side": _strategy_side_name(exit_side),
+                                "size": exit_size,
+                                "reason": "max_drawdown_abs",
+                                "exit_price": round(exit_price, 6),
+                                "pnl": round(pnl, 6),
+                            }
+                        )
+        if telemetry_callback is not None:
+            telemetry_callback(
+                {
+                    "event_name": "bar_snapshot",
+                    "bar_index": idx,
+                    "bar_ts": bar.ts,
+                    "cash": round(cash, 6),
+                    "equity": round(equity, 6),
+                    "peak_equity": round(peak_equity, 6),
+                    "drawdown_abs": round(max(0.0, peak_equity - equity), 6),
+                    "drawdown_pct": round((max_drawdown * 100.0), 6),
+                    "in_position": in_position,
+                    "position_side": _strategy_side_name(side),
+                    "position_size": size if in_position else 0,
+                    "decision_reason": decision.reason,
+                }
+            )
 
     if in_position and side is not None:
         last = bars[-1]
+        exit_side = side
+        exit_size = size
         exit_price = _apply_slippage(last.close, side, config.slippage_bps, is_entry=False)
         pnl = _trade_pnl(side, size, entry_price, exit_price, config.fee_per_order)
         cash += pnl
@@ -267,6 +388,19 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
             )
         )
         equity = cash
+        if execution_callback is not None:
+            execution_callback(
+                {
+                    "event_name": "force_close_end_of_data",
+                    "bar_index": len(bars) - 1,
+                    "bar_ts": last.ts,
+                    "side": _strategy_side_name(exit_side),
+                    "size": exit_size,
+                    "reason": "end_of_data",
+                    "exit_price": round(exit_price, 6),
+                    "pnl": round(pnl, 6),
+                }
+            )
 
     wins = sum(1 for t in trades if t.pnl > 0)
     num_trades = len(trades)

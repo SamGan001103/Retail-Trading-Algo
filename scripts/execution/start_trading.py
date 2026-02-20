@@ -6,6 +6,7 @@ from trading_algo.runtime import ModeOptions, run_mode
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Master launcher for forward, backtest, and train modes.")
     parser.add_argument("--mode", choices=["forward", "backtest", "train"], default="forward")
+    parser.add_argument("--profile", choices=["normal", "debug"], default=None, help="Runtime profile.")
     parser.add_argument("--data-csv", default=None, help="Historical data CSV path for backtest/train modes.")
     parser.add_argument("--strategy", default="oneshot", help="Strategy key (e.g., oneshot, ny_structure).")
     parser.add_argument("--model-out", default="artifacts/models/xgboost_model.json")
@@ -18,6 +19,7 @@ def main() -> None:
     run_mode(
         ModeOptions(
             mode=args.mode,
+            profile=args.profile,
             data_csv=args.data_csv,
             strategy=args.strategy,
             model_out=args.model_out,

@@ -17,16 +17,23 @@
 ## Runtime Flow (`forward`)
 
 1. Load runtime config from `.env`.
-2. Build broker adapter (`BROKER`, currently `projectx`).
-3. Resolve contract id from symbol/live route.
-4. Start realtime user/market streams.
-5. Build bars from stream ticks.
-6. Evaluate strategy decisions (bar and optional tick path).
-7. Place market orders with bracket ticks from strategy decision or defaults.
-8. Enforce runtime safeguards:
+2. Resolve runtime profile (`normal` or `debug`) from CLI/env.
+3. Initialize telemetry sinks (`candidate_trades.jsonl`, `performance.jsonl`).
+4. Build broker adapter (`BROKER`, currently `projectx`).
+5. Resolve contract id from symbol/live route.
+6. Start realtime user/market streams.
+7. Build bars from stream ticks.
+8. Evaluate strategy decisions (bar and optional tick path).
+9. Place market orders with bracket ticks from strategy decision or defaults.
+10. Enforce runtime safeguards:
    - `position_management.guards` limits (positions/orders)
    - `runtime.drawdown_guard` kill-switch (halt + flatten on breach)
-9. Continue until stopped.
+11. Continue until stopped.
+
+Profile behavior:
+
+- `normal`: reduced console output, telemetry append still enabled.
+- `debug`: verbose strategy-process traces + telemetry append.
 
 ## Backtest Flow (`backtest`)
 

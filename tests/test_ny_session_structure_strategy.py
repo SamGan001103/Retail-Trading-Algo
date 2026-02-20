@@ -74,6 +74,8 @@ def test_tick_mode_arms_setup_on_bar_then_enters_on_tick():
     assert bar_decision.should_enter is False
     assert bar_decision.reason == "setup-armed-tick"
     assert strategy.pending_setup() is not None
+    bar_events = strategy.drain_candidate_events()
+    assert {e["status"] for e in bar_events} >= {"detected", "armed"}
 
     tick_decision = strategy.on_tick(
         ts="2026-01-15T14:31:01Z",
@@ -88,6 +90,8 @@ def test_tick_mode_arms_setup_on_bar_then_enters_on_tick():
     assert tick_decision.tp_ticks_abs == 48
     assert tick_decision.reason == "entry-orderflow-sniper"
     assert strategy.pending_setup() is None
+    tick_events = strategy.drain_candidate_events()
+    assert {e["status"] for e in tick_events} >= {"entered"}
 
 
 def test_tick_mode_setup_is_rejected_when_ml_gate_denies():
@@ -126,3 +130,5 @@ def test_tick_mode_setup_is_rejected_when_ml_gate_denies():
     assert decision.should_enter is False
     assert decision.reason.startswith("flat-ml-reject:")
     assert strategy.pending_setup() is None
+    events = strategy.drain_candidate_events()
+    assert any(e.get("status") == "rejected" and "ml-reject" in str(e.get("reason")) for e in events)
