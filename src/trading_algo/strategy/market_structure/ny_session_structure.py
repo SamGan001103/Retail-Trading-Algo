@@ -152,6 +152,7 @@ class NYSessionMarketStructureStrategy(Strategy):
     session_end: str = "16:00"
     tz_name: str = "America/New_York"
     htf_aggregation: int = 5
+    bias_aggregation: int = 60
     htf_swing_strength_high: int = 5
     htf_swing_strength_low: int = 5
     ltf_swing_strength_high: int = 3
@@ -163,6 +164,9 @@ class NYSessionMarketStructureStrategy(Strategy):
     min_confluence_score: int = 1
     require_orderflow: bool = False
     entry_mode: str = "bar"
+    avoid_news: bool = False
+    news_blackouts_utc: list[tuple[datetime, datetime]] = field(default_factory=list, repr=False)
+    news_exit_on_event: bool = False
     max_hold_bars: int = 120
     tick_setup_expiry_bars: int = 3
     tick_history_size: int = 120
@@ -186,12 +190,15 @@ class NYSessionMarketStructureStrategy(Strategy):
     ml_size_floor_score: float = 0.55
     ml_size_ceiling_score: float = 0.90
     enable_exhaustion_market_exit: bool = True
+    ml_decision_policy: str = "off"
     orderflow_filter: OrderFlowFilter | None = None
 
     _session: SessionWindow = field(init=False, repr=False)
     _htf_detector: SwingPointsDetector = field(init=False, repr=False)
+    _bias_detector: SwingPointsDetector = field(init=False, repr=False)
     _ltf_detector: SwingPointsDetector = field(init=False, repr=False)
     _htf_buffer: list[MarketBar] = field(default_factory=list, init=False, repr=False)
+    _bias_buffer: list[MarketBar] = field(default_factory=list, init=False, repr=False)
     _ltf_high_points: list[tuple[int, float]] = field(default_factory=list, init=False, repr=False)
     _ltf_low_points: list[tuple[int, float]] = field(default_factory=list, init=False, repr=False)
     _last_ltf_trend: Trend = field(default="neutral", init=False, repr=False)
@@ -211,6 +218,8 @@ class NYSessionMarketStructureStrategy(Strategy):
             raise ValueError("size must be >= 1")
         if self.htf_aggregation < 1:
             raise ValueError("htf_aggregation must be >= 1")
+        if self.bias_aggregation < 1:
+            raise ValueError("bias_aggregation must be >= 1")
         if self.max_hold_bars < 1:
             raise ValueError("max_hold_bars must be >= 1")
         if self.sweep_expiry_bars < 1:
@@ -243,10 +252,15 @@ class NYSessionMarketStructureStrategy(Strategy):
             raise ValueError("ml_min_size_fraction must be in (0, 1]")
         if not (0 <= self.ml_size_floor_score <= 1 and 0 <= self.ml_size_ceiling_score <= 1):
             raise ValueError("ml_size_floor_score and ml_size_ceiling_score must be in [0, 1]")
+        ml_policy = self.ml_decision_policy.strip().lower()
+        if ml_policy not in {"off", "shadow", "enforce"}:
+            raise ValueError("ml_decision_policy must be one of: off, shadow, enforce")
+        self.ml_decision_policy = ml_policy
         mode = self.entry_mode.strip().lower()
         if mode not in {"bar", "tick"}:
             raise ValueError("entry_mode must be 'bar' or 'tick'")
         self.entry_mode = mode
+        self.news_blackouts_utc = self._normalize_news_blackouts(self.news_blackouts_utc)
 
         self._session = SessionWindow(
             start=_parse_hhmm(self.session_start),
@@ -254,6 +268,11 @@ class NYSessionMarketStructureStrategy(Strategy):
             tz_name=self.tz_name,
         )
         self._htf_detector = SwingPointsDetector(
+            swing_strength_high=self.htf_swing_strength_high,
+            swing_strength_low=self.htf_swing_strength_low,
+            remove_swept_levels=False,
+        )
+        self._bias_detector = SwingPointsDetector(
             swing_strength_high=self.htf_swing_strength_high,
             swing_strength_low=self.htf_swing_strength_low,
             remove_swept_levels=False,
@@ -303,6 +322,7 @@ class NYSessionMarketStructureStrategy(Strategy):
 
     def on_bar(self, bar: MarketBar, context: StrategyContext, position: PositionState) -> StrategyDecision:
         in_session = self._session.contains(bar.ts)
+        in_news_blackout = self._is_news_blackout(bar.ts)
         trend_before = self._last_ltf_trend
 
         ltf_snapshot = self._ltf_detector.update(bar)
@@ -313,6 +333,7 @@ class NYSessionMarketStructureStrategy(Strategy):
         self._trim_points()
 
         self._update_htf(bar, context.index)
+        self._update_bias(bar)
         trend_now = self._compute_ltf_trend()
         choch_bull = self._is_choch_bullish(trend_before, bar.close)
         choch_bear = self._is_choch_bearish(trend_before, bar.close)
@@ -321,6 +342,14 @@ class NYSessionMarketStructureStrategy(Strategy):
 
         if position.in_position:
             self._pending_setup = None
+            if in_news_blackout and self.news_exit_on_event:
+                return StrategyDecision(
+                    should_exit=True,
+                    should_enter=False,
+                    side=position.side if position.side is not None else BUY,
+                    size=position.size,
+                    reason="exit-news-blackout",
+                )
             if not in_session:
                 return StrategyDecision(
                     should_exit=True,
@@ -353,6 +382,15 @@ class NYSessionMarketStructureStrategy(Strategy):
                 side=BUY,
                 size=self.size,
                 reason="flat-outside-session",
+            )
+        if in_news_blackout:
+            self._pending_setup = None
+            return StrategyDecision(
+                should_exit=False,
+                should_enter=False,
+                side=BUY,
+                size=self.size,
+                reason="flat-news-blackout",
             )
 
         long_setup = self._build_setup_environment(
@@ -462,6 +500,15 @@ class NYSessionMarketStructureStrategy(Strategy):
 
         if position.in_position:
             self._pending_setup = None
+            if self._is_news_blackout(ts) and self.news_exit_on_event:
+                side = position.side if position.side is not None else BUY
+                return StrategyDecision(
+                    should_exit=True,
+                    should_enter=False,
+                    side=side,
+                    size=position.size if position.size > 0 else self.size,
+                    reason="tick-news-blackout-exit",
+                )
             self._record_tick_sample(ts, price)
             side = position.side if position.side is not None else BUY
             if self.enable_exhaustion_market_exit and self._tick_exhaustion_exit_signal(side):
@@ -489,6 +536,16 @@ class NYSessionMarketStructureStrategy(Strategy):
                 side=BUY,
                 size=self.size,
                 reason="tick-no-setup",
+            )
+        if self._is_news_blackout(ts):
+            self._emit_candidate_event(planned.setup, status="invalidated", reason="news-blackout")
+            self._pending_setup = None
+            return StrategyDecision(
+                should_exit=False,
+                should_enter=False,
+                side=planned.setup.side,
+                size=planned.size,
+                reason="tick-news-blackout",
             )
         if not self._session.contains(ts):
             self._emit_candidate_event(planned.setup, status="invalidated", reason="outside-session")
@@ -602,9 +659,13 @@ class NYSessionMarketStructureStrategy(Strategy):
         return setup.confluence_score >= self.min_confluence_score
 
     def _evaluate_ml(self, setup: SetupEnvironment) -> SetupMLDecision:
+        if self.ml_decision_policy == "off":
+            return SetupMLDecision(approved=True, score=None, reason="ml-bypassed")
         if self._ml_gate is None:
             return SetupMLDecision(approved=True, score=None, reason="ml-disabled")
         approved, score, reason = self._ml_gate.evaluate(setup)
+        if self.ml_decision_policy == "shadow":
+            return SetupMLDecision(approved=True, score=score, reason=f"ml-shadow:{reason}")
         return SetupMLDecision(approved=bool(approved), score=score, reason=reason)
 
     def _build_entry_risk_plan(
@@ -756,6 +817,11 @@ class NYSessionMarketStructureStrategy(Strategy):
         return f"{setup.ts}:{setup.index}:{side}"
 
     def _emit_candidate_event(self, setup: SetupEnvironment, *, status: str, reason: str) -> None:
+        best_bid = self._orderflow_state.best_bid()
+        best_ask = self._orderflow_state.best_ask()
+        spread = None
+        if best_bid is not None and best_ask is not None:
+            spread = float(best_ask) - float(best_bid)
         self._candidate_events.append(
             {
                 "candidate_id": self._candidate_id(setup),
@@ -774,8 +840,56 @@ class NYSessionMarketStructureStrategy(Strategy):
                 "fib_retracement": setup.fib_retracement,
                 "key_area_proximity": setup.key_area_proximity,
                 "confluence_score": setup.confluence_score,
+                "of_imbalance": self._orderflow_state.imbalance(),
+                "of_top_bid_size": self._orderflow_state.top_bid_size(),
+                "of_top_ask_size": self._orderflow_state.top_ask_size(),
+                "of_best_bid": best_bid,
+                "of_best_ask": best_ask,
+                "of_spread": spread,
+                "of_trade_size": num(self._orderflow_state.trade, "size", "qty", "quantity", "volume", "lastSize"),
+                "of_trade_price": num(self._orderflow_state.trade, "price", "last", "lastPrice", "tradePrice", "close"),
             }
         )
+
+    @staticmethod
+    def _normalize_news_blackouts(
+        intervals: list[tuple[datetime, datetime]],
+    ) -> list[tuple[datetime, datetime]]:
+        normalized: list[tuple[datetime, datetime]] = []
+        for raw_start, raw_end in intervals:
+            start = raw_start if raw_start.tzinfo is not None else raw_start.replace(tzinfo=timezone.utc)
+            end = raw_end if raw_end.tzinfo is not None else raw_end.replace(tzinfo=timezone.utc)
+            start_utc = start.astimezone(timezone.utc)
+            end_utc = end.astimezone(timezone.utc)
+            if end_utc < start_utc:
+                start_utc, end_utc = end_utc, start_utc
+            normalized.append((start_utc, end_utc))
+        if not normalized:
+            return []
+        normalized.sort(key=lambda x: x[0])
+        merged: list[tuple[datetime, datetime]] = []
+        for start, end in normalized:
+            if not merged:
+                merged.append((start, end))
+                continue
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end:
+                merged[-1] = (prev_start, max(prev_end, end))
+                continue
+            merged.append((start, end))
+        return merged
+
+    def _is_news_blackout(self, ts: str) -> bool:
+        if not self.avoid_news or not self.news_blackouts_utc:
+            return False
+        try:
+            now_utc = _parse_ts(ts).astimezone(timezone.utc)
+        except ValueError:
+            return False
+        for start, end in self.news_blackouts_utc:
+            if start <= now_utc < end:
+                return True
+        return False
 
     def _record_tick_sample(self, ts: str, price: float) -> None:
         try:
@@ -829,6 +943,14 @@ class NYSessionMarketStructureStrategy(Strategy):
             self._last_sweep_index = index
             self._last_sweep_price = htf_bar.low
 
+    def _update_bias(self, bar: MarketBar) -> None:
+        self._bias_buffer.append(bar)
+        if len(self._bias_buffer) < self.bias_aggregation:
+            return
+        bias_bar = self._aggregate_bars(self._bias_buffer)
+        self._bias_buffer.clear()
+        self._bias_detector.update(bias_bar)
+
     def _aggregate_bars(self, bars: list[MarketBar]) -> MarketBar:
         return aggregate_bars(bars)
 
@@ -839,7 +961,7 @@ class NYSessionMarketStructureStrategy(Strategy):
         return compute_ltf_trend(self._ltf_high_points, self._ltf_low_points)
 
     def _compute_htf_bias(self) -> Bias:
-        return compute_htf_bias(self._htf_detector)
+        return compute_htf_bias(self._bias_detector)
 
     def _is_choch_bullish(self, trend_before: Trend, close: float) -> bool:
         return is_choch_bullish(trend_before, close, self._ltf_high_points)

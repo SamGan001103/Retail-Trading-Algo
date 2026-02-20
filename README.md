@@ -35,6 +35,12 @@ Windows venv:
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
+Optional train dependency (`--mode train`):
+
+```bash
+pip install xgboost
+```
+
 CLI scripts import `trading_algo` from the `src/` package path. Before running commands, use either:
 
 1. Editable install: `pip install -e .`
@@ -73,10 +79,11 @@ NY structure + position management knobs used by current code:
 ```env
 STRAT_ENTRY_MODE=tick
 STRAT_REQUIRE_ORDERFLOW=false
-STRAT_FORWARD_BAR_SEC=1
+STRAT_FORWARD_BAR_SEC=60
 STRAT_TICK_POLL_SEC=0.25
 STRAT_TICK_POLL_IDLE_SEC=0.25
 STRAT_TICK_POLL_ARMED_SEC=0.05
+STRAT_DEPTH_WARNING_COOLDOWN_SEC=30
 SUB_DEPTH=true
 
 RUNTIME_PROFILE=normal
@@ -88,7 +95,8 @@ DEBUG_TICK_TRACE_EVERY_N=20
 STRAT_NY_SESSION_START=09:30
 STRAT_NY_SESSION_END=16:00
 STRAT_TZ_NAME=America/New_York
-STRAT_HTF_AGGREGATION=5
+STRAT_HTF_AGGREGATION=15
+STRAT_BIAS_AGGREGATION=60
 STRAT_HTF_SWING_HIGH=5
 STRAT_HTF_SWING_LOW=5
 STRAT_LTF_SWING_HIGH=3
@@ -107,6 +115,7 @@ STRAT_TICK_ABSORPTION_TRADES=2
 STRAT_TICK_ICEBERG_RELOADS=2
 
 STRAT_ML_GATE_ENABLED=false
+STRAT_ML_DECISION_POLICY=off
 STRAT_ML_MODEL_PATH=artifacts/models/xgboost_model.json
 STRAT_ML_MIN_PROBA=0.55
 STRAT_ML_FAIL_OPEN=false
@@ -132,6 +141,44 @@ STRAT_DRAWDOWN_GUARD_ENABLED=true
 STRAT_MAX_OPEN_POSITIONS=1
 STRAT_MAX_OPEN_ORDERS_WHILE_FLAT=0
 
+# Backtest candidate capture window/output.
+BACKTEST_SLIP_ENTRY_TICKS=0.0
+BACKTEST_SLIP_STOP_TICKS=0.0
+BACKTEST_SLIP_TP_TICKS=0.0
+BACKTEST_SPREAD_SLIP_K=1.0
+BACKTEST_ENTRY_DELAY_EVENTS=1
+BACKTEST_CANDIDATE_MONTHS=6
+BACKTEST_WALK_FORWARD=false
+BACKTEST_WF_WINDOW_MONTHS=6
+BACKTEST_WF_STEP_MONTHS=1
+# BACKTEST_WF_START_UTC=2025-01-01T00:00:00Z
+# BACKTEST_WF_END_UTC=2026-01-01T00:00:00Z
+BACKTEST_CANDIDATES_CSV=artifacts/telemetry/backtest_candidates.csv
+BACKTEST_MATRIX_CSV=artifacts/telemetry/backtest_candidate_matrix.csv
+BACKTEST_BAR_SEC=60
+BACKTEST_SHADOW_ML_ENABLED=false
+BACKTEST_SHADOW_ML_MODEL_PATH=artifacts/models/xgboost_model.json
+BACKTEST_SHADOW_ML_MIN_PROBA=0.55
+BACKTEST_PREFLIGHT_STRICT=true
+BACKTEST_PREFLIGHT_REQUIRE_SEQ=true
+BACKTEST_PREFLIGHT_MIN_ROWS=1
+BACKTEST_PREFLIGHT_MIN_QUOTE_COVERAGE=0.90
+BACKTEST_PREFLIGHT_MIN_DEPTH_COVERAGE=0.90
+BACKTEST_PREFLIGHT_MIN_SESSION_ROWS=1
+BACKTEST_SENSITIVITY_SWEEP=false
+BACKTEST_SWEEP_ENTRY_DELAYS=0,1,2
+BACKTEST_SWEEP_SLIP_ENTRY_TICKS=0,0.5,1.0
+BACKTEST_SWEEP_SPREAD_SLIP_K=0,1,2
+
+# Optional major-news avoidance during backtest.
+STRAT_AVOID_NEWS=true
+STRAT_NEWS_EXIT_ON_EVENT=false
+BACKTEST_NEWS_CSV=data/news_usd_major.csv
+BACKTEST_NEWS_PRE_MIN=15
+BACKTEST_NEWS_POST_MIN=15
+BACKTEST_NEWS_MAJOR_ONLY=true
+BACKTEST_NEWS_CURRENCIES=USD
+
 # Optional per-symbol overrides.
 # If omitted, defaults are inferred from SYMBOL profile (MNQ/NQ/MES/ES/MGC/GC).
 # STRAT_TICK_SIZE=0.25
@@ -145,8 +192,25 @@ Notes:
 2. `SIDE` accepts `0/1` and `buy/sell` or `long/short`.
 3. Use `.env.example` as the baseline and keep real credentials only in local `.env`.
 4. Mode-focused templates are available: `.env.forward.example`, `.env.backtest.example`, `.env.train.example`.
-5. `STRAT_ENTRY_MODE` defaults to `tick` in `forward` mode and `bar` in `backtest` mode unless explicitly set.
-6. `STRAT_TICK_POLL_SEC` is the base fallback poll interval; idle/armed values can override it.
+5. For `ny_structure` backtests, runtime forces `entry_mode=tick` and `require_orderflow=true`; each fill must pass tick-level orderflow gating.
+6. Forward ML decision policy is controlled by `STRAT_ML_DECISION_POLICY`:
+   - `off`: strategy-only decisions (no ML gate blocks entries)
+   - `shadow`: evaluate ML score/reason but never block entries
+   - `enforce`: gate entries with ML threshold checks
+   If unset, runtime keeps backward compatibility (`enforce` when `STRAT_ML_GATE_ENABLED=true`, otherwise `off`).
+7. `BACKTEST_SHADOW_ML_ENABLED=true` runs ML inference in backtest as log-only metadata (`ml_shadow_*`) without blocking entries.
+8. `BACKTEST_CANDIDATE_MONTHS` selects the most recent window (default `6`) for non-walk-forward runs.
+9. `BACKTEST_WALK_FORWARD=true` enables rolling windows (`BACKTEST_WF_WINDOW_MONTHS`, `BACKTEST_WF_STEP_MONTHS`) and tags rows with `window_id`.
+10. `BACKTEST_CANDIDATES_CSV` appends candidate lifecycle events for each backtest run.
+11. `BACKTEST_MATRIX_CSV` appends one ML-ready row per candidate with execution outcomes.
+12. `BACKTEST_PREFLIGHT_*` enforces dataset quality checks (required columns, UTC timestamps, `(timestamp,seq)` ordering, quote/depth/session coverage).
+13. `BACKTEST_SLIP_*` and `BACKTEST_SPREAD_SLIP_K` control side-correct quote-based fills in tick replay.
+14. `BACKTEST_ENTRY_DELAY_EVENTS` enforces next-event (or more) entry delay for tick entries.
+15. `BACKTEST_SENSITIVITY_SWEEP=true` runs extra stress scenarios over latency/slippage/spread-slip settings.
+16. `BACKTEST_BAR_SEC` controls bar aggregation during NY tick replay (default: `STRAT_FORWARD_BAR_SEC`, typically `60`).
+17. `STRAT_AVOID_NEWS=true` plus `BACKTEST_NEWS_CSV` enables major-news blackout windows for setup/entry filtering.
+18. `STRAT_TICK_POLL_SEC` is the base fallback poll interval; idle/armed values can override it.
+19. Timeframe mapping uses `STRAT_FORWARD_BAR_SEC` as LTF base. Example shown above: LTF=1m, HTF=15m (`STRAT_HTF_AGGREGATION=15`), bias=1h (`STRAT_BIAS_AGGREGATION=60`).
 
 ### 1.3 Run Commands
 
@@ -174,17 +238,50 @@ Forward:
 python scripts/execution/start_trading.py --mode forward --strategy ny_structure --hold-bars 120
 ```
 
+Forward strategy-only (recommended when model is not trained yet):
+
+```bash
+STRAT_ML_DECISION_POLICY=off STRAT_ML_GATE_ENABLED=false \
+python scripts/execution/start_trading.py --mode forward --strategy ny_structure --hold-bars 120
+```
+
 Forward (`debug` profile for step-by-step strategy tracing):
 
 ```bash
 python scripts/execution/start_trading.py --mode forward --profile debug --strategy ny_structure --hold-bars 120
 ```
 
-Backtest:
+Backtest (`ny_structure` requires orderflow-capable CSV):
 
 ```bash
-python scripts/execution/start_trading.py --mode backtest --data-csv data/ohlcv.csv --strategy ny_structure --hold-bars 120
+python scripts/execution/start_trading.py --mode backtest --data-csv data/mnq_orderflow.csv --strategy ny_structure --hold-bars 120
 ```
+
+Backtest walk-forward (example: 6m window, 1m step):
+
+```bash
+BACKTEST_WALK_FORWARD=true BACKTEST_WF_WINDOW_MONTHS=6 BACKTEST_WF_STEP_MONTHS=1 \
+python scripts/execution/start_trading.py --mode backtest --data-csv data/mnq_orderflow.csv --strategy ny_structure --hold-bars 120
+```
+
+Backtest shadow-ML logging (no decision gating):
+
+```bash
+BACKTEST_SHADOW_ML_ENABLED=true BACKTEST_SHADOW_ML_MODEL_PATH=artifacts/models/xgboost_model.json \
+python scripts/execution/start_trading.py --mode backtest --data-csv data/mnq_orderflow.csv --strategy ny_structure --hold-bars 120
+```
+
+ProjectX orderflow CSV capture (realtime stream -> backtest CSV):
+
+```bash
+python scripts/data/export_projectx_orderflow.py --symbol MNQ --duration-sec 1800 --output data/mnq_orderflow_capture.csv
+```
+
+Notes:
+
+1. This exporter captures realtime stream snapshots (quote/trade/depth), not vendor-side 6-month historical replay.
+2. Set `SUB_DEPTH=true` so market depth is subscribed and written.
+3. For `ny_structure` backtests keep depth enabled (default `--require-depth`).
 
 Train:
 
@@ -226,6 +323,13 @@ Telemetry output files (JSONL append):
 
 1. Candidate trades: `artifacts/telemetry/candidate_trades.jsonl`
 2. Performance/execution: `artifacts/telemetry/performance.jsonl`
+3. Backtest candidate CSV append: `artifacts/telemetry/backtest_candidates.csv` (configurable via `BACKTEST_CANDIDATES_CSV`)
+4. Backtest ML matrix CSV append: `artifacts/telemetry/backtest_candidate_matrix.csv` (configurable via `BACKTEST_MATRIX_CSV`)
+5. Backtest CSV rows now include `scenario_id` and `window_id` tags; candidate rows include `ml_shadow_*` fields when shadow mode is enabled.
+6. If an existing backtest CSV has an older header schema, runtime rotates it to `*.legacy_<UTCSTAMP>.csv` and writes a fresh compatible header.
+7. Forward execution events now include `candidate_id` when available, so candidate features can be joined to entry/exit outcomes for ML labeling.
+8. Forward candidate events include structure/orderflow features such as `has_recent_sweep`, `htf_bias`, `bias_ok`, `continuation`, `reversal`, `equal_levels`, `fib_retracement`, `key_area_proximity`, `confluence_score`, `of_imbalance`, top-of-book sizes/prices, spread, and trade price/size.
+9. Forward labels/outcomes come from execution events in `performance.jsonl` (`strategy_*_entry`, exits/flatten/protective exits) and can be joined on `candidate_id`.
 
 ### 1.7 Troubleshooting
 
@@ -248,11 +352,11 @@ If you see `ModuleNotFoundError: No module named 'trading_algo'`:
    - Run strategy loop (bar build + optional tick execution)
    - `debug` profile prints strategy-process traces; `normal` stays concise
 2. `backtest`
-   - Load CSV bars
-   - Instantiate strategy
-   - Simulate entries/exits with slippage/fees
-   - Simulate bracket SL/TP hits from OHLC bars
-   - Emit candidate/performance/execution telemetry via callback hooks
+   - `ny_structure`: load orderflow ticks/depth CSV, enforce tick sniper entry + orderflow gate, aggregate replay bars via `BACKTEST_BAR_SEC`
+   - optional major-news blackout windows (`STRAT_AVOID_NEWS=true`, `BACKTEST_NEWS_CSV`)
+   - other strategies: load OHLCV bars and run bar-only simulation
+   - Simulate entries/exits with slippage/fees and bracket protections
+   - Emit candidate/performance/execution telemetry and append candidate matrix rows for ML training
 3. `train`
    - Build feature matrix from CSV
    - Train XGBoost model
@@ -271,7 +375,7 @@ If you see `ModuleNotFoundError: No module named 'trading_algo'`:
    - HTF bias not opposing side
    - continuation or CHoCH reversal
    - confluence threshold met
-3. ML gate scores setup and approves/rejects
+3. Optional ML layer (`STRAT_ML_DECISION_POLICY`) can be off/shadow/enforce
 4. Position management planning
    - stop-loss level/ticks
    - take-profit level/ticks
@@ -297,7 +401,9 @@ If you see `ModuleNotFoundError: No module named 'trading_algo'`:
    - stop uses invalidation+noise buffer planning
    - target uses valid target levels and median choice when multiple qualify
 5. Backtest specifics:
-   - SL/TP brackets simulated from bar high/low
+   - NY orderflow replay executes/guards on ticks and still runs completed-bar strategy updates
+   - optional major-news blackout can block setup/entry around economic events
+   - Non-orderflow backtests simulate SL/TP brackets from bar high/low
    - if both hit in same bar, stop-loss is prioritized (conservative)
    - `ACCOUNT_MAX_DRAWDOWN_KILLSWITCH > 0` can halt new backtest entries via absolute drawdown threshold
 
@@ -305,7 +411,7 @@ If you see `ModuleNotFoundError: No module named 'trading_algo'`:
 
 ### 3.1 Current Concerns
 
-1. Realtime vs backtest fidelity is still bar-based for many orderflow concepts.
+1. Backtest fidelity now includes NY tick/depth replay, but quality still depends on historical depth coverage and CSV cleanliness.
 2. ML model lifecycle is scaffolded; production validation loops are not fully automated.
 3. Regime drift can degrade both rule edge and ML score quality.
 4. Runtime controls are improving but still need stronger monitoring/alerting surfaces.
@@ -346,6 +452,7 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `docs/architecture.md` | Supplemental architecture notes. | Layering and high-level runtime flow. |
 | `docs/roadmap.md` | Supplemental roadmap notes. | Delivery milestones and priorities. |
 | `scripts/execution/start_trading.py` | Master CLI entrypoint. | Argument parsing and mode dispatch to runtime. |
+| `scripts/data/export_projectx_orderflow.py` | ProjectX stream-to-CSV exporter. | Captures realtime quote/trade/depth snapshots into backtest orderflow CSV format. |
 | `scripts/debug/_common.py` | Shared helper for debug scripts. | Loads runtime config + broker adapter. |
 | `scripts/debug/account_check.py` | Validate configured account exists/tradable. | Account lookup and target account assertion. |
 | `scripts/debug/account_lookup.py` | Print available accounts. | Account listing and selected fields dump. |
@@ -362,8 +469,8 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/api/contracts.py` | Contract search/resolution helpers. | Search contracts and resolve single contract id. |
 | `src/trading_algo/api/factory.py` | API client factory from env. | Env loading and `ProjectXClient` construction. |
 | `src/trading_algo/backtest/__init__.py` | Backtest exports. | CSV loader + backtest engine symbols. |
-| `src/trading_algo/backtest/data.py` | Historical CSV parsing. | Column alias handling and `MarketBar` conversion. |
-| `src/trading_algo/backtest/engine.py` | Backtest simulator. | Slippage/fees, bracket SL/TP checks, drawdown halt, metrics, telemetry callback hooks. |
+| `src/trading_algo/backtest/data.py` | Historical CSV parsing. | OHLCV `MarketBar` loader plus orderflow tick/depth loader. |
+| `src/trading_algo/backtest/engine.py` | Backtest simulator. | Bar-based and tick-replay paths, slippage/fees, protective exits, drawdown halt, telemetry callback hooks. |
 | `src/trading_algo/broker/__init__.py` | Broker layer exports. | Adapter interfaces and ProjectX adapter exports. |
 | `src/trading_algo/broker/base.py` | Broker protocol contracts. | `BrokerAdapter` and stream protocol signatures. |
 | `src/trading_algo/broker/factory.py` | Broker adapter factory. | Runtime config -> concrete adapter selection. |
@@ -375,6 +482,8 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/config/symbol_profile.py` | Symbol default profile mapping. | Tick size/value and DOM wall defaults by symbol. |
 | `src/trading_algo/core/__init__.py` | Core exports. | Side constants and aliases. |
 | `src/trading_algo/core/side.py` | Shared side constants. | `BUY`/`SELL` and related typing helpers. |
+| `src/trading_algo/data_export/__init__.py` | Data export exports. | ProjectX capture API exports. |
+| `src/trading_algo/data_export/projectx_orderflow.py` | ProjectX orderflow capture logic. | Stream polling, row normalization, depth/seq CSV writing, capture stats. |
 | `src/trading_algo/execution/__init__.py` | Execution exports. | Engine and bracket signing exports. |
 | `src/trading_algo/execution/engine.py` | Order/position execution engine. | Place market+brackets, snapshot, flatten, safety checks. |
 | `src/trading_algo/execution/factory.py` | Execution engine from env. | Build API client + `ExecutionEngine` pair. |
@@ -388,7 +497,7 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/runtime/__init__.py` | Runtime exports. | Mode runner, main runtime entry, drawdown guard exports. |
 | `src/trading_algo/runtime/bot_runtime.py` | Main forward runtime loop. | Stream polling, bar build, tick handling, order placement, guards, profile-aware runtime tracing, telemetry emission. |
 | `src/trading_algo/runtime/drawdown_guard.py` | Runtime drawdown tracker/kill-switch helper. | Realized/unrealized PnL tracking and breach signaling. |
-| `src/trading_algo/runtime/mode_runner.py` | Mode orchestrator. | Strategy factory, forward/backtest/train dispatch, profile resolution, telemetry wiring. |
+| `src/trading_algo/runtime/mode_runner.py` | Mode orchestrator. | Strategy factory, forward/backtest/train dispatch, news blackout loading, candidate/matrix CSV wiring. |
 | `src/trading_algo/runtime/realtime_client.py` | Compatibility shim for legacy imports. | Alias to `ProjectXRealtimeStream`. |
 | `src/trading_algo/strategy/__init__.py` | Strategy exports. | Base types + concrete strategy exports. |
 | `src/trading_algo/strategy/base.py` | Strategy interfaces/types. | `StrategyDecision`, `MarketBar`, `PositionState`, protocol. |
@@ -404,18 +513,25 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/telemetry/pipeline.py` | Telemetry router/sinks. | Profile-aware console trace + JSONL append pipeline for candidate/performance/execution events. |
 | `tests/__init__.py` | Test package marker. | Enables package-style test imports. |
 | `tests/test_backtest.py` | Backtest behavior tests. | CSV load, one-shot run, bracket simulation, drawdown halt tests. |
+| `tests/test_backtest_orderflow.py` | Tick/depth replay tests. | Side-correct fills, `(timestamp,seq)` ordering, entry-delay semantics, and boundary handling checks. |
+| `tests/test_bot_runtime_depth.py` | Forward runtime depth checks. | Depth payload availability detection for tick/orderflow runtime path. |
 | `tests/test_broker_factory.py` | Broker factory tests. | Env-based adapter construction checks. |
 | `tests/test_config.py` | Config/env parsing tests. | Runtime config loading and env parser checks. |
 | `tests/test_drawdown_guard.py` | Drawdown guard tests. | Breach and realized-PnL accounting scenarios. |
 | `tests/test_execution_engine.py` | Execution engine tests. | Bracket sign rules, payload checks, entry eligibility checks. |
 | `tests/test_imports.py` | Import smoke tests. | Public module import validation. |
 | `tests/test_ml_gate.py` | ML gate unit tests. | Disabled/fail-closed gate behavior checks. |
+| `tests/test_mode_runner_backtest_candidates.py` | Backtest mode-runner data checks. | Windowing, preflight/news filters, candidate/matrix CSV wiring, and shadow-ML logging checks. |
+| `tests/test_mode_runner_strategy_config.py` | Mode-runner strategy wiring tests. | Forward/backtest NY strategy entry/orderflow/ML-gate config behavior checks. |
 | `tests/test_ny_session_structure_strategy.py` | NY strategy tests. | Session checks, setup arming, tick entry, ML rejection behavior, candidate-event emission checks. |
 | `tests/test_orderflow_filter.py` | Orderflow filter tests. | Depth imbalance extraction and long/short gating checks. |
+| `tests/test_projectx_orderflow_export.py` | ProjectX capture exporter tests. | Orderflow-row normalization, depth-required filtering, seq continuation checks. |
 | `tests/test_position_management_planners.py` | SL/TP planner tests. | Stop planner, RRR filter, median target selection tests. |
 | `tests/test_swing_points.py` | Swing detection tests. | Current/past swing transitions and swept-level behavior. |
 
 ## 5. Data Format (Backtest/Train)
+
+### 5.1 OHLCV CSV (`train` + non-orderflow backtests)
 
 Accepted OHLCV column aliases:
 
@@ -432,4 +548,63 @@ Example:
 timestamp,open,high,low,close,volume
 2026-01-01T00:00:00Z,100,101,99,100.5,1000
 2026-01-01T00:01:00Z,100.5,101.2,100.1,100.9,1200
+```
+
+### 5.2 Orderflow CSV (`ny_structure` backtest, required)
+
+Minimum requirements:
+
+1. timestamp column (`timestamp` / `datetime` / `time` / `date`)
+2. usable price (`trade_price` / `tradePrice` / `price` / `last` / `lastPrice` / `close` / `c`, or `bid` + `ask`)
+3. usable depth on rows used for entry gating:
+   - `bestBidSize` + `bestAskSize` (or aliases `bidSize`, `askSize`, `bid_size`, `ask_size`)
+   - or JSON depth ladders (`depth_bids`, `depth_asks`)
+4. deterministic order key required by default preflight: `seq` / `sequence` / `event_seq` (same-timestamp replay stability)
+
+Useful optional columns:
+
+1. quote prices: `bid`, `ask`
+2. trade size: `trade_size`, `size`, `qty`, `quantity`, `lastSize`, `volume`, `v`
+3. top-of-book prices: `bestBid`, `bestAsk`
+4. event order key aliases: `seq`, `sequence`, `event_seq`, `eventSequence`
+
+Execution semantics in NY orderflow backtest:
+
+1. market buy fills from ask; market sell fills from bid
+2. long SL/TP triggers use bid side; short SL/TP triggers use ask side
+3. quote-missing protective checks are ignored (conservative)
+
+Example:
+
+```csv
+timestamp,seq,price,bid,ask,trade_size,bestBidSize,bestAskSize
+2026-01-01T14:30:00Z,1001,21850.25,21850.00,21850.25,3,120,90
+2026-01-01T14:30:00.250Z,1002,21850.50,21850.25,21850.50,2,132,86
+```
+
+### 5.3 News CSV (`ny_structure` backtest, optional)
+
+Used only when `STRAT_AVOID_NEWS=true`.
+
+Minimum columns:
+
+1. event time: `timestamp` / `datetime` / `time` / `date`
+
+Optional filters:
+
+1. impact rank: `impact` / `importance` / `severity` / `priority` / `rank` / `impact_level`
+2. currency tag: `currency` / `ccy` / `curr` / `country`
+
+Major-event filtering:
+
+1. with `BACKTEST_NEWS_MAJOR_ONLY=true`, values containing `high`, `major`, `red`, `critical`, or numeric `>=3` are treated as major
+2. `BACKTEST_NEWS_CURRENCIES` (default `USD`) filters rows when a currency column exists
+3. blackout intervals are evaluated in UTC with half-open semantics `[start, end)` (exact `end` timestamp is allowed)
+
+Example:
+
+```csv
+timestamp,impact,currency,event
+2026-01-10T13:30:00Z,high,USD,CPI
+2026-01-15T13:30:00Z,3,USD,Retail Sales
 ```

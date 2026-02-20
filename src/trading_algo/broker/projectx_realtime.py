@@ -12,7 +12,6 @@ from trading_algo.api import ProjectXClient
 from trading_algo.config import env_bool
 
 DEBUG_RTC = env_bool("DEBUG_RTC", False)
-SUB_DEPTH = env_bool("SUB_DEPTH", False)
 
 
 @dataclass
@@ -192,7 +191,7 @@ class ProjectXRealtimeStream:
             self._user_conn.send("SubscribeTrades", [self.account_id])
             self._mkt_conn.send("SubscribeContractQuotes", [self._contract_id])
             self._mkt_conn.send("SubscribeContractTrades", [self._contract_id])
-            if SUB_DEPTH:
+            if env_bool("SUB_DEPTH", False):
                 self._mkt_conn.send("SubscribeContractMarketDepth", [self._contract_id])
         except Exception as exc:
             self._log("Subscription error:", repr(exc))

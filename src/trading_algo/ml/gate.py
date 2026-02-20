@@ -8,15 +8,41 @@ from trading_algo.core import BUY
 
 
 class SetupLike(Protocol):
-    side: int
-    has_recent_sweep: bool
-    bias_ok: bool
-    continuation: bool
-    reversal: bool
-    equal_levels: bool
-    fib_retracement: bool
-    key_area_proximity: bool
-    confluence_score: int
+    @property
+    def side(self) -> int:
+        ...
+
+    @property
+    def has_recent_sweep(self) -> bool:
+        ...
+
+    @property
+    def bias_ok(self) -> bool:
+        ...
+
+    @property
+    def continuation(self) -> bool:
+        ...
+
+    @property
+    def reversal(self) -> bool:
+        ...
+
+    @property
+    def equal_levels(self) -> bool:
+        ...
+
+    @property
+    def fib_retracement(self) -> bool:
+        ...
+
+    @property
+    def key_area_proximity(self) -> bool:
+        ...
+
+    @property
+    def confluence_score(self) -> int:
+        ...
 
 
 @dataclass(frozen=True)

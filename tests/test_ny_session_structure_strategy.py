@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from trading_algo.core import BUY, SELL
 from trading_algo.strategy import MarketBar, NYSessionMarketStructureStrategy, PositionState, SetupEnvironment, StrategyContext
 
@@ -46,6 +48,7 @@ def test_tick_mode_arms_setup_on_bar_then_enters_on_tick():
         entry_mode="tick",
         require_orderflow=False,
         min_confluence_score=1,
+        ml_decision_policy="enforce",
     )
     strategy._build_setup_environment = lambda *args, **kwargs: SetupEnvironment(  # type: ignore[attr-defined]
         side=kwargs["side"],
@@ -103,6 +106,7 @@ def test_tick_mode_setup_is_rejected_when_ml_gate_denies():
         entry_mode="tick",
         require_orderflow=False,
         min_confluence_score=1,
+        ml_decision_policy="enforce",
     )
     strategy.set_ml_gate(RejectGate())
     strategy._build_setup_environment = lambda *args, **kwargs: SetupEnvironment(  # type: ignore[attr-defined]
@@ -132,3 +136,129 @@ def test_tick_mode_setup_is_rejected_when_ml_gate_denies():
     assert strategy.pending_setup() is None
     events = strategy.drain_candidate_events()
     assert any(e.get("status") == "rejected" and "ml-reject" in str(e.get("reason")) for e in events)
+
+
+def test_tick_mode_ml_policy_off_bypasses_rejecting_gate():
+    class RejectGate:
+        def evaluate(self, setup):
+            return False, 0.1, "reject"
+
+    class _Plan:
+        def __init__(self, setup):
+            self.setup = setup
+            self.size = 1
+            self.sl_ticks_abs = 10
+            self.tp_ticks_abs = 30
+            self.ml_score = None
+
+    strategy = NYSessionMarketStructureStrategy(
+        entry_mode="tick",
+        require_orderflow=False,
+        min_confluence_score=1,
+        ml_decision_policy="off",
+    )
+    strategy.set_ml_gate(RejectGate())
+    strategy._build_setup_environment = lambda *args, **kwargs: SetupEnvironment(  # type: ignore[attr-defined]
+        side=kwargs["side"],
+        index=kwargs["context"].index,
+        ts=kwargs["bar"].ts,
+        close=kwargs["bar"].close,
+        has_recent_sweep=True,
+        htf_bias="bullish",
+        bias_ok=True,
+        continuation=True,
+        reversal=False,
+        equal_levels=True,
+        fib_retracement=False,
+        key_area_proximity=False,
+        confluence_score=1,
+    )
+    strategy._setup_ready = lambda setup: setup.side == BUY  # type: ignore[attr-defined]
+    strategy._build_entry_risk_plan = lambda setup, **kwargs: _Plan(setup)  # type: ignore[attr-defined]
+
+    decision = strategy.on_bar(
+        bar=_bar("2026-01-15T14:31:00Z", 100, 101, 99, 100),
+        context=StrategyContext(index=10, total_bars=100),
+        position=PositionState(in_position=False),
+    )
+    assert decision.should_enter is False
+    assert decision.reason == "setup-armed-tick"
+    assert strategy.pending_setup() is not None
+    events = strategy.drain_candidate_events()
+    assert any(e.get("status") == "armed" for e in events)
+    assert not any("ml-reject" in str(e.get("reason")) for e in events)
+
+
+def test_tick_mode_news_blackout_invalidates_pending_setup():
+    class _Plan:
+        def __init__(self, setup):
+            self.setup = setup
+            self.size = 1
+            self.sl_ticks_abs = 10
+            self.tp_ticks_abs = 30
+            self.ml_score = None
+
+    strategy = NYSessionMarketStructureStrategy(
+        entry_mode="tick",
+        require_orderflow=False,
+        min_confluence_score=1,
+        avoid_news=True,
+        news_blackouts_utc=[
+            (
+                datetime(2026, 1, 15, 14, 31, 20, tzinfo=timezone.utc),
+                datetime(2026, 1, 15, 14, 31, 40, tzinfo=timezone.utc),
+            )
+        ],
+    )
+    strategy._build_setup_environment = lambda *args, **kwargs: SetupEnvironment(  # type: ignore[attr-defined]
+        side=kwargs["side"],
+        index=kwargs["context"].index,
+        ts=kwargs["bar"].ts,
+        close=kwargs["bar"].close,
+        has_recent_sweep=True,
+        htf_bias="bullish",
+        bias_ok=True,
+        continuation=True,
+        reversal=False,
+        equal_levels=True,
+        fib_retracement=False,
+        key_area_proximity=False,
+        confluence_score=1,
+    )
+    strategy._setup_ready = lambda setup: setup.side == BUY  # type: ignore[attr-defined]
+    strategy._tick_entry_ready = lambda side: side == BUY  # type: ignore[attr-defined]
+    strategy._build_entry_risk_plan = lambda setup, **kwargs: _Plan(setup)  # type: ignore[attr-defined]
+
+    bar_decision = strategy.on_bar(
+        bar=_bar("2026-01-15T14:31:00Z", 100, 101, 99, 100),
+        context=StrategyContext(index=10, total_bars=100),
+        position=PositionState(in_position=False),
+    )
+    assert bar_decision.reason == "setup-armed-tick"
+    assert strategy.pending_setup() is not None
+
+    tick_decision = strategy.on_tick(
+        ts="2026-01-15T14:31:30Z",
+        price=100.1,
+        context=StrategyContext(index=10, total_bars=100),
+        position=PositionState(in_position=False),
+    )
+    assert tick_decision.should_enter is False
+    assert tick_decision.reason == "tick-news-blackout"
+    assert strategy.pending_setup() is None
+    events = strategy.drain_candidate_events()
+    assert any(e.get("status") == "invalidated" and e.get("reason") == "news-blackout" for e in events)
+
+
+def test_news_blackout_half_open_allows_exact_end_timestamp():
+    strategy = NYSessionMarketStructureStrategy(
+        avoid_news=True,
+        news_blackouts_utc=[
+            (
+                datetime(2026, 1, 15, 14, 31, 20, tzinfo=timezone.utc),
+                datetime(2026, 1, 15, 14, 31, 40, tzinfo=timezone.utc),
+            )
+        ],
+    )
+    assert strategy._is_news_blackout("2026-01-15T14:31:39Z") is True  # type: ignore[attr-defined]
+    assert strategy._is_news_blackout("2026-01-15T14:31:40Z") is False  # type: ignore[attr-defined]

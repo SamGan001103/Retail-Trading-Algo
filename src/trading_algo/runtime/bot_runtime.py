@@ -116,6 +116,24 @@ def _drawdown_killswitch_from_env() -> float:
     return env_float("ACCOUNT_MAX_DRAWDOWN_KILLSWITCH", env_float("ACCOUNT_MAX_DRAWDOWN", 2_500.0))
 
 
+def _strategy_entry_mode(strategy: Strategy) -> str:
+    return str(getattr(strategy, "entry_mode", "")).strip().lower()
+
+
+def _depth_payload_available(depth: dict[str, Any] | None) -> bool:
+    if not isinstance(depth, dict):
+        return False
+    bids = depth.get("bids")
+    asks = depth.get("asks")
+    if isinstance(bids, list) and len(bids) > 0:
+        return True
+    if isinstance(asks, list) and len(asks) > 0:
+        return True
+    if _num(depth, "bestBidSize", "bidSize", "bestAskSize", "askSize") is not None:
+        return True
+    return False
+
+
 def _strategy_side_name(side: int | None) -> str:
     if side == 0:
         return "buy"
@@ -155,19 +173,24 @@ def _drain_candidate_events(
     source: str,
     event_ts: str,
     context_index: int,
-) -> None:
+) -> str | None:
     drain = getattr(strategy, "drain_candidate_events", None)
     if not callable(drain):
-        return
+        return None
     try:
         events = drain()
     except Exception:
-        return
+        return None
     if not isinstance(events, list):
-        return
+        return None
+    entered_candidate_id: str | None = None
     for event in events:
         if not isinstance(event, dict):
             continue
+        candidate_id = event.get("candidate_id")
+        status = str(event.get("status") or "").strip().lower()
+        if status == "entered" and candidate_id is not None and str(candidate_id).strip() != "":
+            entered_candidate_id = str(candidate_id)
         if telemetry is not None:
             payload: dict[str, Any] = {
                 "event_name": "strategy_candidate",
@@ -177,6 +200,7 @@ def _drain_candidate_events(
             }
             payload.update(event)
             telemetry.emit_candidate(payload)
+    return entered_candidate_id
 
 
 def _run_legacy_loop(
@@ -373,6 +397,21 @@ def _run_strategy_loop(
         strategy_tick_poll_idle_sec=tick_poll_idle_sec,
         strategy_tick_poll_armed_sec=tick_poll_armed_sec,
     )
+    entry_mode = _strategy_entry_mode(strategy)
+    depth_warning_cooldown_sec = max(5.0, env_float("STRAT_DEPTH_WARNING_COOLDOWN_SEC", 30.0))
+    expect_depth = entry_mode == "tick"
+    sub_depth_enabled = env_bool("SUB_DEPTH", False)
+    if expect_depth and not sub_depth_enabled:
+        _runtime_log(
+            profile,
+            telemetry,
+            "orderflow-depth-warning",
+            important=True,
+            reason="SUB_DEPTH is disabled while entry_mode=tick",
+            contract_id=contract_id,
+            sub_depth=False,
+        )
+    last_depth_warning_ts = 0.0
     limits = RiskLimits(
         max_open_positions=max(1, env_int("STRAT_MAX_OPEN_POSITIONS", 1)),
         max_open_orders_while_flat=max(0, env_int("STRAT_MAX_OPEN_ORDERS_WHILE_FLAT", 0)),
@@ -395,6 +434,7 @@ def _run_strategy_loop(
     was_in_position = False
     exit_grace_until = 0.0
     tick_counter = 0
+    active_candidate_id: str | None = None
 
     if telemetry is not None:
         telemetry.emit_performance(
@@ -419,6 +459,7 @@ def _run_strategy_loop(
         if was_in_position and not in_position:
             exit_grace_until = now_ts + float(config.exit_grace_sec)
             bars_in_position = 0
+            active_candidate_id = None
         was_in_position = in_position
         in_exit_grace = now_ts < exit_grace_until
 
@@ -435,6 +476,7 @@ def _run_strategy_loop(
                         "cancel_attempted": bool(cancel_attempted),
                         "close_attempted": bool(close_attempted),
                         "reason": limits_reason,
+                        "candidate_id": active_candidate_id,
                     }
                 )
             time.sleep(tick_poll_idle_sec)
@@ -454,6 +496,33 @@ def _run_strategy_loop(
                 setup_armed = pending_setup_getter() is not None
             except Exception:
                 setup_armed = False
+
+        if expect_depth and (setup_armed or in_position):
+            depth_ok = _depth_payload_available(depth)
+            if not depth_ok and (now_ts - last_depth_warning_ts) >= depth_warning_cooldown_sec:
+                _runtime_log(
+                    profile,
+                    telemetry,
+                    "orderflow-depth-warning",
+                    important=True,
+                    reason="No usable depth payload while tick orderflow path is active",
+                    contract_id=contract_id,
+                    sub_depth=sub_depth_enabled,
+                )
+                if telemetry is not None:
+                    telemetry.emit_performance(
+                        {
+                            "event_name": "orderflow_depth_warning",
+                            "contract_id": contract_id,
+                            "reason": "missing_depth_payload",
+                            "sub_depth": bool(sub_depth_enabled),
+                            "entry_mode": entry_mode,
+                            "setup_armed": bool(setup_armed),
+                            "in_position": bool(in_position),
+                        }
+                    )
+                last_depth_warning_ts = now_ts
+
         poll_sleep_sec = tick_poll_armed_sec if (setup_armed or in_position) else tick_poll_idle_sec
 
         event_dt = _extract_event_dt(quote, trade)
@@ -511,6 +580,7 @@ def _run_strategy_loop(
                             "cancel_attempted": bool(cancel_attempted),
                             "close_attempted": bool(close_attempted),
                             "reason": "drawdown_guard_tripped",
+                            "candidate_id": active_candidate_id,
                         }
                     )
             time.sleep(poll_sleep_sec)
@@ -525,6 +595,13 @@ def _run_strategy_loop(
                 StrategyContext(index=bar_index, total_bars=bar_index + 1),
                 pos_state,
             )
+            tick_entered_candidate_id = _drain_candidate_events(
+                strategy,
+                telemetry,
+                source="tick",
+                event_ts=tick_ts,
+                context_index=bar_index,
+            )
             if tick_decision.should_exit and in_position and not in_exit_grace:
                 cancel_attempted, close_attempted = broker.flatten(config.account_id)
                 if telemetry is not None:
@@ -535,6 +612,7 @@ def _run_strategy_loop(
                             "reason": tick_decision.reason,
                             "cancel_attempted": bool(cancel_attempted),
                             "close_attempted": bool(close_attempted),
+                            "candidate_id": active_candidate_id,
                         }
                     )
             elif tick_decision.should_enter and (not in_position) and (not orders) and (not in_exit_grace):
@@ -560,17 +638,13 @@ def _run_strategy_loop(
                             "tp_ticks_abs": max(1, tp_ticks),
                             "success": bool(response.get("success")),
                             "raw_response": response,
+                            "candidate_id": tick_entered_candidate_id,
                         }
                     )
                 if not response.get("success"):
                     _runtime_log(profile, telemetry, "strategy-tick-entry-rejected", response=response)
-            _drain_candidate_events(
-                strategy,
-                telemetry,
-                source="tick",
-                event_ts=tick_ts,
-                context_index=bar_index,
-            )
+                elif tick_entered_candidate_id is not None:
+                    active_candidate_id = tick_entered_candidate_id
 
         if telemetry is not None and (_is_debug(profile) and (tick_counter % telemetry.debug_tick_trace_every_n() == 0)):
             telemetry.emit_performance(
@@ -597,7 +671,7 @@ def _run_strategy_loop(
             assert bar_open is not None and bar_high is not None and bar_low is not None and bar_close is not None
             completed = _build_bar(current_bucket, bar_sec, bar_open, bar_high, bar_low, bar_close, bar_volume)
             decision = strategy.on_bar(completed, StrategyContext(index=bar_index, total_bars=bar_index + 1), pos_state)
-            _drain_candidate_events(
+            bar_entered_candidate_id = _drain_candidate_events(
                 strategy,
                 telemetry,
                 source="bar",
@@ -614,6 +688,7 @@ def _run_strategy_loop(
                             "reason": decision.reason,
                             "cancel_attempted": bool(cancel_attempted),
                             "close_attempted": bool(close_attempted),
+                            "candidate_id": active_candidate_id,
                         }
                     )
             elif decision.should_enter and (not in_position) and (not orders) and (not in_exit_grace):
@@ -639,10 +714,13 @@ def _run_strategy_loop(
                             "tp_ticks_abs": max(1, tp_ticks),
                             "success": bool(response.get("success")),
                             "raw_response": response,
+                            "candidate_id": bar_entered_candidate_id,
                         }
                     )
                 if not response.get("success"):
                     _runtime_log(profile, telemetry, "strategy-bar-entry-rejected", response=response)
+                elif bar_entered_candidate_id is not None:
+                    active_candidate_id = bar_entered_candidate_id
 
             if in_position:
                 bars_in_position += 1
@@ -694,6 +772,7 @@ def _run_strategy_loop(
                         "contract_id": contract_id,
                         "cancel_attempted": bool(cancel_attempted),
                         "close_attempted": bool(close_attempted),
+                        "candidate_id": active_candidate_id,
                     }
                 )
 
