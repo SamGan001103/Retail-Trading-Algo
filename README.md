@@ -12,9 +12,16 @@ Primary entrypoint:
 python scripts/execution/start_trading.py
 ```
 
+Supplemental docs:
+
+1. `docs/architecture.md`
+2. `docs/roadmap.md`
+
 ## 1. User Instructions
 
 ### 1.1 Setup
+
+Prerequisite: Python `>=3.11` (see `pyproject.toml`).
 
 ```bash
 pip install -r requirements.txt
@@ -152,6 +159,8 @@ Accepted strategy aliases:
 1. `oneshot`, `one_shot`, `one-shot`
 2. `ny_structure`, `ny_session`, `market_structure`, `mnq_ny`
 
+If `--data-csv` is omitted for `backtest` or `train`, runtime falls back to `BACKTEST_DATA_CSV` from env.
+
 Forward:
 
 ```bash
@@ -198,6 +207,13 @@ python scripts/debug/position_close_contract.py
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
+### 1.7 Troubleshooting
+
+If you see `ModuleNotFoundError: No module named 'trading_algo'`:
+
+1. Re-run `pip install -e .` (or `.\.venv\Scripts\python.exe -m pip install -e .`).
+2. Or set current shell path: `$env:PYTHONPATH="src"`.
+
 ## 2. Pipeline
 
 ### 2.1 Mode Pipeline
@@ -223,7 +239,7 @@ python scripts/debug/position_close_contract.py
 1. Module responsibilities
    - `swing_points.py`: stateful HTF/LTF swing detection and snapshots
    - `liquidity_sweep.py`: HTF aggregation, wick-sweep detection, sweep freshness
-   - `structure_signals.py`: HTF bias, LTF trend, CHoCH, confluence checks
+   - `structure_signals.py`: HTF bias, LTF trend, CHoCH, confluence checks, protocol-typed detector interfaces
    - `orderflow.py`: depth imbalance filtering, DOM liquidity levels, tick micro-timing/exhaustion
    - `ny_session_structure.py`: orchestration across setup, gating, sizing, and execution
 2. Completed-bar setup environment
@@ -356,7 +372,7 @@ This table reflects the current working tree files (excluding cache/temp folders
 | `src/trading_algo/strategy/market_structure/__init__.py` | Market-structure package exports. | Re-exports NY strategy plus sweep/swing/orderflow primitives. |
 | `src/trading_algo/strategy/market_structure/liquidity_sweep.py` | HTF sweep utilities. | HTF bar aggregation, wick sweep detection, sweep freshness checks. |
 | `src/trading_algo/strategy/market_structure/orderflow.py` | Orderflow/tick microstructure utilities. | Depth imbalance filter, DOM liquidity extraction, tick entry/exhaustion signals. |
-| `src/trading_algo/strategy/market_structure/structure_signals.py` | Structure signal helpers. | LTF trend, HTF bias, CHoCH, equal-level/fib/key-area confluence checks. |
+| `src/trading_algo/strategy/market_structure/structure_signals.py` | Structure signal helpers. | LTF trend, HTF bias, CHoCH, equal-level/fib/key-area confluence checks, typed detector protocols. |
 | `src/trading_algo/strategy/market_structure/swing_points.py` | Stateful swing-point detectors. | Swing level lifecycle, snapshots, multi-timeframe wrapper. |
 | `src/trading_algo/strategy/market_structure/ny_session_structure.py` | Orchestrating NY session strategy. | Setup assembly, ML gate, SL/TP planning, risk sizing, bar/tick execution control. |
 | `src/trading_algo/telemetry/__init__.py` | Telemetry exports. | Logger helper exports. |
