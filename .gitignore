@@ -1,8 +1,11 @@
 .env
+.env.backup*
+.env.*backup*
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+tmp_testdata/
 build/
 dist/
 *.egg-info/

@@ -8,7 +8,7 @@ __all__ = [
     "core",
     "execution",
     "ml",
-    "risk",
+    "position_management",
     "runtime",
     "strategy",
     "telemetry",

@@ -1,60 +1,36 @@
 # Retail Trading Algo (ProjectX / TopstepX)
 
-This README is the user instruction manual for running the algo in:
+This repository runs a futures trading stack with three modes:
 
-- `forward` mode (realtime/forward testing, broker-connected)
-- `backtest` mode (historical simulation)
-- `train` mode (ML training scaffold for XGBoost)
+1. `forward`: realtime broker-connected execution loop
+2. `backtest`: historical simulation
+3. `train`: ML model training scaffold (XGBoost)
 
-## 1. Project Layout
+Primary entrypoint:
 
-```text
-src/
-  trading_algo/          # Core implementation
-    broker/              # Broker adapter boundary (current implementation: projectx)
-    core/                # Shared constants/types (broker-agnostic)
-scripts/
-  execution/             # Main launchers
-  debug/                 # Debug/ops utilities (routed through broker adapter)
-tests/
-docs/
+```bash
+python scripts/execution/start_trading.py
 ```
 
-Canonical code is in `src/trading_algo`.
+## 1. User Instructions
 
-## 2. Setup
-
-From repo root:
+### 1.1 Setup
 
 ```bash
 pip install -r requirements.txt
 pip install -e .
 ```
 
-If using venv on Windows:
+Windows venv:
 
 ```bash
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-## 3. One Main File To Start
+### 1.2 Configure `.env`
 
-Run this file for all modes:
-
-```bash
-python scripts/execution/start_trading.py
-```
-
-Select mode with `--mode`:
-
-- `--mode forward`
-- `--mode backtest`
-- `--mode train`
-
-## 4. Environment Variables (`.env`)
-
-### Required for `forward` mode
+Use this as the minimum runtime template:
 
 ```env
 BROKER=projectx
@@ -67,85 +43,29 @@ BROKER_MARKET_HUB_URL=https://.../hubs/market
 
 BOT_ENABLED=0
 TRADING_ENVIRONMENT=DEMO
+LIVE=false
+FLATTEN_ON_START=false
+TRADE_ON_START=false
+EXIT_GRACE_SEC=5
 
 SYMBOL=MNQ
-LIVE=false
 SIDE=0
 SIZE=1
 SL_TICKS=40
 TP_TICKS=80
 LOOP_SEC=1
-EXIT_GRACE_SEC=5
-FLATTEN_ON_START=false
-TRADE_ON_START=false
 ```
 
-Notes:
-
-- `BROKER` defaults to `projectx` if omitted.
-- `SIDE` accepts `0/1` and also `buy/sell` or `long/short`.
-- Preferred broker-neutral keys are `BROKER_*` and are used by runtime/config.
-- Current adapter implementation is `projectx`; broker abstraction is in `src/trading_algo/broker/`.
-- Legacy ProjectX keys are still accepted for backward compatibility:
-  - `PROJECTX_BASE_URL`, `PROJECTX_USERNAME`, `PROJECTX_API_KEY`
-  - `RTC_USER_HUB_URL`, `RTC_MARKET_HUB_URL`
-
-### Optional for `backtest` mode
+NY structure + position management knobs used by current code:
 
 ```env
-BACKTEST_DATA_CSV=data/ohlcv.csv
-BACKTEST_INITIAL_CASH=10000
-BACKTEST_FEE_PER_ORDER=1.0
-BACKTEST_SLIPPAGE_BPS=1.0
-```
+STRAT_ENTRY_MODE=tick
+STRAT_REQUIRE_ORDERFLOW=false
+STRAT_FORWARD_BAR_SEC=1
+STRAT_TICK_POLL_IDLE_SEC=0.25
+STRAT_TICK_POLL_ARMED_SEC=0.05
+SUB_DEPTH=true
 
-## 5. Run Commands
-
-### A) Forward testing / realtime
-
-```bash
-python scripts/execution/start_trading.py --mode forward
-```
-
-Run market-structure strategy in forward mode:
-
-```bash
-python scripts/execution/start_trading.py --mode forward --strategy ny_structure --hold-bars 120
-```
-
-Important:
-
-- `BOT_ENABLED=1` is required to actually run trading loop.
-- Keep `LIVE=false` unless you intentionally switch to live routing.
-- Forward runtime fails fast if realtime user/market streams do not connect at startup.
-- Forward strategy runtime builds bars from realtime stream (`STRAT_FORWARD_BAR_SEC`, default uses `LOOP_SEC`).
-- NY structure defaults to `STRAT_ENTRY_MODE=tick` in `forward` mode:
-  - setup environment is evaluated on completed bars
-  - ML gate evaluates setup candidates
-  - approved setups are executed by tick-level orderflow sniper logic
-- Streams remain subscribed continuously for bar-building and orderflow context.
-- Tick sniper evaluation runs only when a setup is armed (or while in-position), with adaptive polling cadence.
-- L2 orderflow gating stays adapter-routed:
-  - `STRAT_REQUIRE_ORDERFLOW=true` enables orderflow gate in strategy.
-  - `SUB_DEPTH=true` enables depth subscription on brokers that support it (ProjectX implemented).
-
-### B) Backtesting
-
-```bash
-python scripts/execution/start_trading.py --mode backtest --data-csv data/ohlcv.csv --strategy oneshot --hold-bars 20
-```
-
-You can also omit `--data-csv` if `BACKTEST_DATA_CSV` is set in `.env`.
-
-Market-structure strategy (NY session implementation):
-
-```bash
-python scripts/execution/start_trading.py --mode backtest --data-csv data/ohlcv.csv --strategy ny_structure --hold-bars 120
-```
-
-Optional strategy env knobs:
-
-```env
 STRAT_NY_SESSION_START=09:30
 STRAT_NY_SESSION_END=16:00
 STRAT_TZ_NAME=America/New_York
@@ -159,8 +79,6 @@ STRAT_SWEEP_EXPIRY_BARS=40
 STRAT_EQUAL_LEVEL_TOL_BPS=8
 STRAT_KEY_AREA_TOL_BPS=12
 STRAT_MIN_CONFLUENCE=1
-STRAT_REQUIRE_ORDERFLOW=false
-STRAT_ENTRY_MODE=bar
 STRAT_TICK_SETUP_EXPIRY_BARS=3
 STRAT_TICK_HISTORY_SIZE=120
 STRAT_TICK_MIN_IMBALANCE=0.12
@@ -168,51 +86,68 @@ STRAT_TICK_MIN_TRADE_SIZE=1.0
 STRAT_TICK_SPOOF_COLLAPSE=0.35
 STRAT_TICK_ABSORPTION_TRADES=2
 STRAT_TICK_ICEBERG_RELOADS=2
-STRAT_TICK_POLL_IDLE_SEC=0.25
-STRAT_TICK_POLL_ARMED_SEC=0.05
+
 STRAT_ML_GATE_ENABLED=false
 STRAT_ML_MODEL_PATH=artifacts/models/xgboost_model.json
 STRAT_ML_MIN_PROBA=0.55
 STRAT_ML_FAIL_OPEN=false
+
+# Split drawdown controls:
+# - STRAT_ACCOUNT_MAX_DRAWDOWN: sizing budget anchor.
+# - ACCOUNT_MAX_DRAWDOWN_KILLSWITCH: runtime/backtest trading halt threshold.
+STRAT_ACCOUNT_MAX_DRAWDOWN=2000
+ACCOUNT_MAX_DRAWDOWN_KILLSWITCH=2000
+ACCOUNT_MAX_DRAWDOWN=2000
+
+STRAT_MAX_TRADE_DRAWDOWN_FRACTION=0.15
+STRAT_MIN_RRR=3.0
+STRAT_MAX_RRR=10.0
+STRAT_SL_NOISE_BUFFER_TICKS=2
+STRAT_SL_MAX_TICKS=200
+STRAT_TP_FRONT_RUN_TICKS=2
+STRAT_ML_MIN_SIZE_FRACTION=0.35
+STRAT_ML_SIZE_FLOOR_SCORE=0.55
+STRAT_ML_SIZE_CEILING_SCORE=0.90
+STRAT_ENABLE_EXHAUSTION_MARKET_EXIT=true
+STRAT_DRAWDOWN_GUARD_ENABLED=true
+STRAT_MAX_OPEN_POSITIONS=1
+STRAT_MAX_OPEN_ORDERS_WHILE_FLAT=0
+
+# Optional per-symbol overrides.
+# If omitted, defaults are inferred from SYMBOL profile (MNQ/NQ/MES/ES/MGC/GC).
+# STRAT_TICK_SIZE=0.25
+# STRAT_TICK_VALUE=0.5
+# STRAT_DOM_LIQUIDITY_WALL_SIZE=800
 ```
 
-`STRAT_FORWARD_BAR_SEC` is used in `forward` mode for realtime bar aggregation and is not used by `backtest` mode.
-`STRAT_TICK_POLL_IDLE_SEC` controls forward tick polling when no setup is armed.
-`STRAT_TICK_POLL_ARMED_SEC` controls forward tick polling when setup is armed (or in-position).
-`STRAT_TICK_POLL_SEC` is a legacy/default fallback if the two explicit polling vars are not set.
+Notes:
 
-### C) ML training scaffold (XGBoost)
+1. `BROKER_*` keys are preferred; legacy aliases (`PROJECTX_*`, `RTC_*`) are still accepted.
+2. `SIDE` accepts `0/1` and `buy/sell` or `long/short`.
+3. Use `.env.example` as the baseline and keep real credentials only in local `.env`.
+4. Mode-focused templates are available: `.env.forward.example`, `.env.backtest.example`, `.env.train.example`.
+
+### 1.3 Run Commands
+
+Forward:
+
+```bash
+python scripts/execution/start_trading.py --mode forward --strategy ny_structure --hold-bars 120
+```
+
+Backtest:
+
+```bash
+python scripts/execution/start_trading.py --mode backtest --data-csv data/ohlcv.csv --strategy ny_structure --hold-bars 120
+```
+
+Train:
 
 ```bash
 python scripts/execution/start_trading.py --mode train --data-csv data/ohlcv.csv --model-out artifacts/models/xgboost_model.json
 ```
 
-If `xgboost` is missing:
-
-```bash
-pip install xgboost
-```
-
-## 6. Historical CSV Format (Backtest/Train)
-
-CSV must include OHLCV columns. Accepted names:
-
-- timestamp: `timestamp` or `datetime` or `time` or `date`
-- open: `open` or `o`
-- high: `high` or `h`
-- low: `low` or `l`
-- close: `close` or `c`
-- volume: `volume` or `v`
-
-Example:
-
-```csv
-timestamp,open,high,low,close,volume
-2026-01-01T00:00:00Z,100,101,99,100.5,1000
-2026-01-01T00:01:00Z,100.5,101.2,100.1,100.9,1200
-```
-
-## 7. Debug/Ops Scripts
+### 1.4 Debug / Ops Commands
 
 ```bash
 python scripts/debug/account_lookup.py
@@ -226,290 +161,195 @@ python scripts/debug/positions_open.py
 python scripts/debug/position_close_contract.py
 ```
 
-All debug scripts call the broker adapter interface, so the same commands are reusable across supported broker adapters.
+### 1.5 Safety Checklist
 
-## 8. Quick Safety Checklist
+1. Keep `BOT_ENABLED=0` while validating setup.
+2. Use `scripts/debug/account_check.py` to verify account routing.
+3. Keep `LIVE=false` until forward testing sign-off.
+4. Start with `SIZE=1`.
+5. Confirm both `STRAT_ACCOUNT_MAX_DRAWDOWN` and `ACCOUNT_MAX_DRAWDOWN_KILLSWITCH` before enabling.
 
-Before enabling trading:
+## 2. Pipeline
 
-1. Keep `BOT_ENABLED=0` while validating connections.
-2. Confirm account with `scripts/debug/account_check.py`.
-3. Confirm market contract with `scripts/debug/market_lookup.py`.
-4. Keep `LIVE=false` for forward testing.
-5. Use small size (`SIZE=1`) initially.
+### 2.1 Mode Pipeline
 
-## 9. Tests
+1. `forward`
+   - Load runtime config
+   - Build broker adapter
+   - Resolve contract
+   - Start realtime streams
+   - Run strategy loop (bar build + optional tick execution)
+2. `backtest`
+   - Load CSV bars
+   - Instantiate strategy
+   - Simulate entries/exits with slippage/fees
+   - Simulate bracket SL/TP hits from OHLC bars
+3. `train`
+   - Build feature matrix from CSV
+   - Train XGBoost model
+   - Save model artifact
 
-```bash
-pytest -q
-```
+### 2.2 NY Structure Decision Pipeline
 
-Windows venv:
-
-```bash
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-## 10. Current Scope
-
-- Good for infrastructure validation and forward testing.
-- Backtest/train are implemented as scaffolding and can be extended.
-- Strategy layer includes a working NY-session market-structure implementation plus tests, but it is not final production alpha yet.
-
-## 11. Main Entry Summary
-
-If you remember only one file, use:
-
-```bash
-scripts/execution/start_trading.py
-```
-
-Then choose mode with `--mode`.
-
-## 12. Build Pipeline Checklist (Start -> Finish)
-
-Use this as the master progress tracker.
-
-- [x] Step 1: Repository structure organized (`src/`, `scripts/execution`, `scripts/debug`, `tests`, `docs`).
-- [x] Step 2: Core broker execution foundation in place (auth client, execution engine, realtime runtime loop).
-- [x] Step 3: Master mode switch in place (`forward`, `backtest`, `train`) via `scripts/execution/start_trading.py`.
-- [x] Step 4: Backtest scaffold implemented (CSV loader, basic simulator, PnL/return/win-rate/max-drawdown metrics).
-- [x] Step 5: ML training scaffold implemented (`train` mode + XGBoost trainer skeleton).
-- [x] Step 6: Turn your trading strategy into code (baseline NY-session market-structure and oneshot strategies implemented).
-- [ ] Step 7: Download and curate historical market data (clean OHLCV, session boundaries, symbol rollover handling).
-- [ ] Step 8: Backtest the coded strategy and log every trade candidate/outcome (market structure snapshot + result).
-- [ ] Step 9: Build a strategy-trade dataset from those logs (one row per candidate trade, with labels).
-- [ ] Step 10: Feature engineer the collected trade dataset (no leakage, consistent feature versions).
-- [ ] Step 11: Train and validate ML classifier (XGBoost) on historical strategy trades.
-- [x] Step 12: Integrate baseline ML gate + orderflow sniper into strategy runtime (bar-based setup environment, ML gate, tick-level execution path).
-- [ ] Step 13: Upgrade backtest realism and validation (fees/slippage, walk-forward, out-of-sample checks).
-- [ ] Step 14: Harden risk and production controls (daily limits, cooldowns, kill-switch, monitoring and alerts).
-- [ ] Step 15: Forward test sign-off and staged live rollout (micro-size first, rollback plan ready).
-- [ ] Step 16: Continuous retraining loop (new trades appended, periodic retrain/re-validate/redeploy).
-
-Current focus:
-
-- Next practical milestone is Step 6 -> Step 8 (code strategy, get data, backtest and record trade outcomes).
-
-## 13. Drift Concerns and Adaptive Plan (Working Notes)
-
-Target decision process is a 3-stage pipeline:
-
-1. `Setup environment layer (rule-based)`: validates candidate setup context from market structure.
-   For NY-session structure, candidate context includes:
+1. Completed-bar setup environment
    - recent matching HTF sweep
-   - HTF bias not opposing trade direction
+   - HTF bias not opposing side
    - continuation or CHoCH reversal
-   - confluence threshold met (equal levels / retracement / key area proximity)
-2. `ML gate layer`: scores the setup environment and decides take/skip.
-3. `Orderflow execution layer`: if ML approves, use orderflow/L2 concepts to snipe entry timing.
-
-Implementation status:
-
-- Setup environment logic is implemented in strategy code.
-- Baseline ML gate + tick-level orderflow sniper path is implemented in forward runtime.
-- Current sniper concepts are heuristic approximations (absorption/iceberg/spoofing/micro-timing) and should be calibrated with live data.
-
-Known drift risks:
-
-- `ML drift`: model quality decays as market distribution changes.
-- `Rule drift`: setup logic itself stops matching current market behavior (frequency, quality, and execution response drift).
-
-### A) ML Layer Drift Handling (baseline plan)
-
-- Train on rolling windows (recent data weighted higher).
-- Retrain on schedule (`daily` / `weekly` / `monthly`) based on data volume and strategy horizon.
-- Use walk-forward validation and out-of-sample gates before promotion.
-
-### B) Rule Layer Drift Handling (main concern)
-
-Treat rule logic as adaptive, not fixed:
-
-- Parameterize rule family instead of one hardcoded setup definition.
-- Maintain a `champion + challengers` set of rule variants.
-- Track per-variant health:
-  - candidate frequency
-  - win rate / expectancy
-  - net PnL after costs
-  - slippage/fill quality
-  - max drawdown / instability
-- Add drift/change detectors (example methods: ADWIN/CUSUM/changepoint).
-- On drift trigger:
-  - reduce or pause variant weight
-  - run local re-optimization on recent window
-  - promote challenger only after out-of-sample check
-
-### C) Regime-Aware Adaptation
-
-Use regime features (volatility, trend strength, liquidity/orderflow state) to route decisions:
-
-- Map market state -> preferred rule variant set.
-- Keep per-regime performance stats.
-- Reweight variants online with strict risk caps.
-
-### D) Guardrails (must stay static)
-
-Adaptation is allowed only inside predefined limits:
-
-- hard position/risk caps
-- kill-switch on abnormal drawdown or execution degradation
-- cooldown rules after loss clusters
-- rollback path to last stable champion
-
-### E) Near-Term Implementation Notes
-
-1. Log every candidate from strategy layer (including rejected ones) with full feature snapshot.
-2. Split metrics by regime and by rule variant.
-3. Add a drift monitor job that evaluates rolling KPIs.
-4. Add promotion policy: challenger must beat champion in recent out-of-sample window with risk constraints.
-5. Integrate this loop into `train` + `forward` workflows incrementally.
-
-## 14. How To Find the Optimal Data/Parameter Size (Conversation Notes)
-
-If you're asking "how do I find the optimal amount of data (e.g., training window size / weighting)?" the only reliable answer in a drifting system (like markets) is:
-
-Empirically, with walk-forward experiments and stability criteria.
-
-Below is a clean engineering procedure to implement.
-
-### 1) Define what "optimal" means first
-
-Pick one primary objective, for example:
-
-- Net PnL
-- Sharpe / Sortino
-- AUC / logloss (for the ML layer)
-- Composite objective: `PnL - lambda * drawdown - mu * turnover`
-
-Also track stability metrics:
-
-- Performance variance across windows
-- Worst-case drawdown
-- Regime-to-regime consistency
-
-Do not optimize only mean performance. Optimize robust forward performance.
-
-### 2) Choose candidate data windows / weighting schemes
-
-Test a grid of plausible options, for example:
-
-Hard rolling windows:
-
-- 1 month
-- 3 months
-- 6 months
-- 12 months
-- 24 months
-
-Time-decay weighting:
-
-- Half-life = 1 month
-- Half-life = 3 months
-- Half-life = 6 months
-- Half-life = 12 months
-
-You can test both and compare.
-
-### 3) Use walk-forward evaluation (mandatory)
-
-For each candidate window/weighting:
-
-- Train on window `W`
-- Test on next period `H` (for example next week/month)
-- Slide forward:
-  - Train: `[t0 - W, t0]`
-  - Test: `(t0, t0 + H]`
-- Repeat over many folds
-
-Collect:
-
-- Mean performance
-- Standard deviation / downside risk
-- Worst fold performance
-- Stability across time
-
-Never use random splits.
-
-### 4) Score each option with a robust objective
-
-Do not just pick the highest average return.
-
-Use a robust score, for example:
-
-`Score = Mean - alpha * Std - beta * MaxDrawdown`
-
-Or use:
-
-- Median fold performance
-- 25th percentile fold performance
-- Percent of folds profitable
-
-This reduces overfitting to lucky windows.
-
-### 5) Look for the bias-variance tradeoff curve
-
-Common pattern:
-
-- Very short window: adapts fast, but noisy/unstable/overfit
-- Very long window: stable, but stale/slow to adapt
-- Middle window: best forward robustness
-
-Plot:
-
-- Window size vs performance
-- Window size vs variance/drawdown
-
-Pick the knee of the curve, not the extreme.
-
-### 6) Do this separately for each layer
-
-- ML layer (`feature -> label` mapping)
-- Rule layer parameters (thresholds, structure filters)
-- Optionally per regime
-
-It is normal for layers to prefer different windows.
-
-### 7) Add a meta-rule: re-optimize the window periodically
-
-Markets change, so re-run window selection every:
-
-- 3 months or 6 months
-
-Or trigger re-evaluation if live performance materially deviates from expected distribution.
-
-Adaptation itself must be adaptive.
-
-### 8) Fast starting heuristic (intraday futures)
-
-Start with rolling windows:
-
-- 1M, 3M, 6M, 12M
-
-Working prior:
-
-- ML layer often prefers 3-6 months
-- Rule calibration often prefers 6-12 months
-
-Then let walk-forward results decide.
-
-### 9) Key principle
-
-The "optimal" window is not universal.
-It is the one that gives the best forward stability, not the highest backtest peak.
-
-If you optimize for peak backtest, you will overfit the window itself.
-
-### 10) Inputs needed to make this concrete
-
-Provide:
-
-- Instrument + timeframe
-- Retraining frequency
-- Data volume per month
-- Main objective (PnL, Sharpe, AUC, etc.)
-
-Then define:
-
-- A specific window grid
-- A walk-forward scheme
-- A scoring function tailored to this system
+   - confluence threshold met
+2. ML gate scores setup and approves/rejects
+3. Position management planning
+   - stop-loss level/ticks
+   - take-profit level/ticks
+   - contract sizing with risk cap and ML scaling
+4. Execution
+   - `entry_mode=bar`: place immediately
+   - `entry_mode=tick`: arm setup, wait for tick-level orderflow timing
+5. Runtime safeguards
+   - position/order count limits
+   - drawdown guard (halt + flatten on breach)
+
+### 2.3 Risk and Execution Behavior
+
+1. Per-trade risk budget:
+   - `risk_budget = STRAT_ACCOUNT_MAX_DRAWDOWN * STRAT_MAX_TRADE_DRAWDOWN_FRACTION`
+2. Contracts:
+   - `max_contracts = floor(risk_budget / (stop_ticks * STRAT_TICK_VALUE))`
+   - final size constrained by `SIZE` and ML scaling
+3. RRR filter:
+   - only trades with `STRAT_MIN_RRR <= RRR <= STRAT_MAX_RRR`
+4. Stops/targets:
+   - stop uses invalidation+noise buffer planning
+   - target uses valid target levels and median choice when multiple qualify
+5. Backtest specifics:
+   - SL/TP brackets simulated from bar high/low
+   - if both hit in same bar, stop-loss is prioritized (conservative)
+   - `ACCOUNT_MAX_DRAWDOWN_KILLSWITCH > 0` can halt new backtest entries via absolute drawdown threshold
+
+## 3. Concerns and Plan
+
+### 3.1 Current Concerns
+
+1. Realtime vs backtest fidelity is still bar-based for many orderflow concepts.
+2. ML model lifecycle is scaffolded; production validation loops are not fully automated.
+3. Regime drift can degrade both rule edge and ML score quality.
+4. Runtime controls are improving but still need stronger monitoring/alerting surfaces.
+
+### 3.2 Practical Plan
+
+1. Data and labeling
+   - log every setup candidate (accepted and rejected)
+   - include structure context, ML score, orderflow features, realized outcome
+2. Validation
+   - walk-forward evaluation with fixed promotion criteria
+   - measure stability by regime, not only global averages
+3. Runtime hardening
+   - expand kill-switches (session/daily caps)
+   - add alerts for stream faults, stale data, execution anomalies
+4. Deployment
+   - micro-size forward stage
+   - staged scale-up only after objective thresholds are met
+
+## 4. File Tree Reference
+
+This table reflects the current working tree files (excluding cache/temp folders).
+
+| Path | What it does | Key contents |
+| --- | --- | --- |
+| `.env` | Local runtime configuration (not committed by default). | Broker creds, symbol, strategy/risk knobs, runtime flags. |
+| `.env.example` | Safe baseline config template. | Placeholder values, split drawdown vars, optional override comments. |
+| `.env.forward.example` | Forward-mode template. | Broker/runtime/strategy settings for live forward loop. |
+| `.env.backtest.example` | Backtest-mode template. | Data/simulation/risk settings for historical runs. |
+| `.env.train.example` | Train-mode template. | Dataset/model artifact defaults for training runs. |
+| `.gitignore` | Git ignore rules. | `.env`, virtualenv, caches, build artifacts. |
+| `.vscode/settings.json` | Editor/workspace settings. | VS Code local configuration. |
+| `README.md` | Main operator documentation. | Setup, run instructions, pipeline, concerns, file map. |
+| `conftest.py` | Pytest bootstrap config. | Test path/bootstrap helpers. |
+| `pyproject.toml` | Build/tool configuration. | Packaging metadata, pyright/pytest/format settings. |
+| `requirements.txt` | Runtime dependency list. | `python-dotenv`, `requests`, `signalrcore`, etc. |
+| `setup.py` | Setuptools packaging entry. | `src`-layout package discovery/install metadata. |
+| `docs/architecture.md` | Supplemental architecture notes. | Layering and high-level runtime flow. |
+| `docs/roadmap.md` | Supplemental roadmap notes. | Delivery milestones and priorities. |
+| `scripts/execution/start_trading.py` | Master CLI entrypoint. | Argument parsing and mode dispatch to runtime. |
+| `scripts/debug/_common.py` | Shared helper for debug scripts. | Loads runtime config + broker adapter. |
+| `scripts/debug/account_check.py` | Validate configured account exists/tradable. | Account lookup and target account assertion. |
+| `scripts/debug/account_lookup.py` | Print available accounts. | Account listing and selected fields dump. |
+| `scripts/debug/flatten_all.py` | Emergency flatten helper. | Cancel open orders + close open positions. |
+| `scripts/debug/market_lookup.py` | Contract search helper. | Symbol/contract lookup through adapter. |
+| `scripts/debug/order_place.py` | Manual test order placement. | Sends market order with bracket params. |
+| `scripts/debug/order_cancel.py` | Manual order cancel helper. | Cancel by order id through adapter. |
+| `scripts/debug/orders_open.py` | Inspect open orders. | Prints currently open orders. |
+| `scripts/debug/positions_open.py` | Inspect open positions. | Prints currently open positions. |
+| `scripts/debug/position_close_contract.py` | Close a specific contract position. | Contract-targeted close request. |
+| `src/trading_algo/__init__.py` | Package root exports. | Module namespace list (`api`, `runtime`, `position_management`, etc.). |
+| `src/trading_algo/api/__init__.py` | API layer exports. | ProjectX client + contract helpers. |
+| `src/trading_algo/api/client.py` | Authenticated HTTP API client. | Token handling, POST wrapper, request logging hooks. |
+| `src/trading_algo/api/contracts.py` | Contract search/resolution helpers. | Search contracts and resolve single contract id. |
+| `src/trading_algo/api/factory.py` | API client factory from env. | Env loading and `ProjectXClient` construction. |
+| `src/trading_algo/backtest/__init__.py` | Backtest exports. | CSV loader + backtest engine symbols. |
+| `src/trading_algo/backtest/data.py` | Historical CSV parsing. | Column alias handling and `MarketBar` conversion. |
+| `src/trading_algo/backtest/engine.py` | Backtest simulator. | Slippage/fees, bracket SL/TP checks, drawdown halt, metrics. |
+| `src/trading_algo/broker/__init__.py` | Broker layer exports. | Adapter interfaces and ProjectX adapter exports. |
+| `src/trading_algo/broker/base.py` | Broker protocol contracts. | `BrokerAdapter` and stream protocol signatures. |
+| `src/trading_algo/broker/factory.py` | Broker adapter factory. | Runtime config -> concrete adapter selection. |
+| `src/trading_algo/broker/projectx.py` | ProjectX adapter implementation. | Resolve contracts, stream creation, execution operations. |
+| `src/trading_algo/broker/projectx_realtime.py` | ProjectX SignalR realtime stream. | Quote/trade/depth subscriptions, state cache, reconnect flow. |
+| `src/trading_algo/config/__init__.py` | Config exports. | `RuntimeConfig`, env parsers, config loader. |
+| `src/trading_algo/config/env.py` | Primitive env parsing helpers. | `env_bool`, `env_int`, `env_float`, required env helper. |
+| `src/trading_algo/config/settings.py` | Runtime configuration model. | `RuntimeConfig` dataclass + loader/validation. |
+| `src/trading_algo/config/symbol_profile.py` | Symbol default profile mapping. | Tick size/value and DOM wall defaults by symbol. |
+| `src/trading_algo/core/__init__.py` | Core exports. | Side constants and aliases. |
+| `src/trading_algo/core/side.py` | Shared side constants. | `BUY`/`SELL` and related typing helpers. |
+| `src/trading_algo/execution/__init__.py` | Execution exports. | Engine and bracket signing exports. |
+| `src/trading_algo/execution/engine.py` | Order/position execution engine. | Place market+brackets, snapshot, flatten, safety checks. |
+| `src/trading_algo/execution/factory.py` | Execution engine from env. | Build API client + `ExecutionEngine` pair. |
+| `src/trading_algo/ml/__init__.py` | ML exports. | Gate and trainer symbols. |
+| `src/trading_algo/ml/gate.py` | Setup ML gate logic. | Setup feature mapping, model load, approve/reject decision. |
+| `src/trading_algo/ml/trainer.py` | XGBoost training scaffold. | Feature/label extraction from CSV and model save. |
+| `src/trading_algo/position_management/__init__.py` | Position management exports. | Guards + SL/TP planner exports. |
+| `src/trading_algo/position_management/guards.py` | Runtime position/order guardrails. | `RiskLimits`, `enforce_position_limits`. |
+| `src/trading_algo/position_management/stop_loss.py` | Stop-loss planner. | Invalidation-level stop selection and noise buffer logic. |
+| `src/trading_algo/position_management/take_profit.py` | Take-profit planner. | RRR-filtered target selection and median valid target logic. |
+| `src/trading_algo/runtime/__init__.py` | Runtime exports. | Mode runner, main runtime entry, drawdown guard exports. |
+| `src/trading_algo/runtime/bot_runtime.py` | Main forward runtime loop. | Stream polling, bar build, tick handling, order placement, guards. |
+| `src/trading_algo/runtime/drawdown_guard.py` | Runtime drawdown tracker/kill-switch helper. | Realized/unrealized PnL tracking and breach signaling. |
+| `src/trading_algo/runtime/mode_runner.py` | Mode orchestrator. | Strategy factory, forward/backtest/train dispatch, env wiring. |
+| `src/trading_algo/runtime/realtime_client.py` | Compatibility shim for legacy imports. | Alias to `ProjectXRealtimeStream`. |
+| `src/trading_algo/strategy/__init__.py` | Strategy exports. | Base types + concrete strategy exports. |
+| `src/trading_algo/strategy/base.py` | Strategy interfaces/types. | `StrategyDecision`, `MarketBar`, `PositionState`, protocol. |
+| `src/trading_algo/strategy/simple.py` | Minimal sample strategy. | One-shot long strategy for baseline testing. |
+| `src/trading_algo/strategy/market_structure/__init__.py` | Market-structure exports. | NY strategy and swing/orderflow support exports. |
+| `src/trading_algo/strategy/market_structure/swing_points.py` | Swing detection utilities. | Swing levels, snapshots, multi-timeframe helpers. |
+| `src/trading_algo/strategy/market_structure/ny_session_structure.py` | Main NY session strategy. | Setup environment, ML gate, risk planning, tick sniper path. |
+| `src/trading_algo/telemetry/__init__.py` | Telemetry exports. | Logger helper exports. |
+| `src/trading_algo/telemetry/logging.py` | Logging helper. | Logger factory and shared logging defaults. |
+| `tests/__init__.py` | Test package marker. | Enables package-style test imports. |
+| `tests/test_backtest.py` | Backtest behavior tests. | CSV load, one-shot run, bracket simulation, drawdown halt tests. |
+| `tests/test_broker_factory.py` | Broker factory tests. | Env-based adapter construction checks. |
+| `tests/test_config.py` | Config/env parsing tests. | Runtime config loading and env parser checks. |
+| `tests/test_drawdown_guard.py` | Drawdown guard tests. | Breach and realized-PnL accounting scenarios. |
+| `tests/test_execution_engine.py` | Execution engine tests. | Bracket sign rules, payload checks, entry eligibility checks. |
+| `tests/test_imports.py` | Import smoke tests. | Public module import validation. |
+| `tests/test_ml_gate.py` | ML gate unit tests. | Disabled/fail-closed gate behavior checks. |
+| `tests/test_ny_session_structure_strategy.py` | NY strategy tests. | Session checks, setup arming, tick entry, ML rejection behavior. |
+| `tests/test_orderflow_filter.py` | Orderflow filter tests. | Depth imbalance extraction and long/short gating checks. |
+| `tests/test_position_management_planners.py` | SL/TP planner tests. | Stop planner, RRR filter, median target selection tests. |
+| `tests/test_swing_points.py` | Swing detection tests. | Current/past swing transitions and swept-level behavior. |
+
+## 5. Data Format (Backtest/Train)
+
+Accepted OHLCV column aliases:
+
+1. timestamp: `timestamp`, `datetime`, `time`, `date`
+2. open: `open`, `o`
+3. high: `high`, `h`
+4. low: `low`, `l`
+5. close: `close`, `c`
+6. volume: `volume`, `v`
+
+Example:
+
+```csv
+timestamp,open,high,low,close,volume
+2026-01-01T00:00:00Z,100,101,99,100.5,1000
+2026-01-01T00:01:00Z,100.5,101.2,100.1,100.9,1200
+```

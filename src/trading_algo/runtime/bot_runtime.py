@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from trading_algo.broker import broker_from_runtime_config
-from trading_algo.config import RuntimeConfig, env_float, env_int, load_runtime_config
+from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, get_symbol_profile, load_runtime_config
 from trading_algo.core import BUY
+from trading_algo.position_management import RiskLimits, enforce_position_limits
+from trading_algo.runtime.drawdown_guard import DrawdownGuard
 from trading_algo.strategy import MarketBar, OrderFlowState, PositionState, Strategy, StrategyContext
 
 
@@ -101,10 +103,36 @@ def _position_entry_price(position: dict[str, Any]) -> float | None:
     return _num(position, "avgPrice", "averagePrice", "entryPrice", "price")
 
 
+def _tick_size_and_value_from_env(symbol: str) -> tuple[float, float]:
+    profile = get_symbol_profile(symbol)
+    return (
+        env_float("STRAT_TICK_SIZE", profile.tick_size),
+        env_float("STRAT_TICK_VALUE", profile.tick_value),
+    )
+
+
+def _drawdown_killswitch_from_env() -> float:
+    return env_float("ACCOUNT_MAX_DRAWDOWN_KILLSWITCH", env_float("ACCOUNT_MAX_DRAWDOWN", 2_500.0))
+
+
 def _run_legacy_loop(config: RuntimeConfig, broker, contract_id: str, rt) -> None:
     traded_once = False
     was_in_position = False
     exit_grace_until = 0.0
+    last_price: float | None = None
+
+    limits = RiskLimits(
+        max_open_positions=max(1, env_int("STRAT_MAX_OPEN_POSITIONS", 1)),
+        max_open_orders_while_flat=max(0, env_int("STRAT_MAX_OPEN_ORDERS_WHILE_FLAT", 0)),
+    )
+    tick_size, tick_value = _tick_size_and_value_from_env(config.symbol)
+    drawdown_guard = DrawdownGuard(
+        max_drawdown_abs=_drawdown_killswitch_from_env(),
+        tick_size=tick_size,
+        tick_value=tick_value,
+        enabled=env_bool("STRAT_DRAWDOWN_GUARD_ENABLED", True),
+    )
+    drawdown_tripped = False
 
     while True:
         orders_all, positions_all = rt.snapshot()
@@ -117,6 +145,44 @@ def _run_legacy_loop(config: RuntimeConfig, broker, contract_id: str, rt) -> Non
             exit_grace_until = now + float(config.exit_grace_sec)
         was_in_position = in_position
         in_exit_grace = now < exit_grace_until
+
+        limits_ok, limits_reason = enforce_position_limits(len(positions), len(orders), limits)
+        if not limits_ok:
+            print(f"position-limits-breach: {limits_reason}; flattening.")
+            cancel_attempted, close_attempted = broker.flatten(config.account_id)
+            print(f"Flatten: cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
+            time.sleep(config.loop_sec)
+            continue
+
+        quote = rt.last_quote(contract_id)
+        trade = rt.last_trade(contract_id)
+        price = _extract_price(quote, trade, last_price)
+        if price is not None:
+            last_price = price
+            if positions:
+                p0 = positions[0]
+                pos_state = PositionState(
+                    in_position=True,
+                    side=_position_side(p0),
+                    size=_position_size(p0),
+                    entry_price=_position_entry_price(p0),
+                    bars_in_position=0,
+                )
+            else:
+                pos_state = PositionState(in_position=False)
+            dd = drawdown_guard.update(pos_state, price)
+            if dd.breached and not drawdown_tripped:
+                drawdown_tripped = True
+                print(
+                    "drawdown-guard-tripped:"
+                    f" drawdown_abs={dd.drawdown_abs:.2f} max={drawdown_guard.max_drawdown_abs:.2f}"
+                )
+        if drawdown_tripped:
+            if in_position and not in_exit_grace:
+                cancel_attempted, close_attempted = broker.flatten(config.account_id)
+                print(f"Flatten: cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
+            time.sleep(config.loop_sec)
+            continue
 
         if not in_position:
             if config.trade_on_start and (not traded_once) and (not orders) and (not in_exit_grace):
@@ -152,6 +218,18 @@ def _run_strategy_loop(config: RuntimeConfig, broker, contract_id: str, rt, stra
     print(f"strategy_bar_sec={bar_sec}")
     print(f"strategy_tick_poll_idle_sec={tick_poll_idle_sec}")
     print(f"strategy_tick_poll_armed_sec={tick_poll_armed_sec}")
+    limits = RiskLimits(
+        max_open_positions=max(1, env_int("STRAT_MAX_OPEN_POSITIONS", 1)),
+        max_open_orders_while_flat=max(0, env_int("STRAT_MAX_OPEN_ORDERS_WHILE_FLAT", 0)),
+    )
+    tick_size, tick_value = _tick_size_and_value_from_env(config.symbol)
+    drawdown_guard = DrawdownGuard(
+        max_drawdown_abs=_drawdown_killswitch_from_env(),
+        tick_size=tick_size,
+        tick_value=tick_value,
+        enabled=env_bool("STRAT_DRAWDOWN_GUARD_ENABLED", True),
+    )
+    drawdown_tripped = False
 
     current_bucket: int | None = None
     bar_open = bar_high = bar_low = bar_close = None
@@ -174,6 +252,14 @@ def _run_strategy_loop(config: RuntimeConfig, broker, contract_id: str, rt, stra
             bars_in_position = 0
         was_in_position = in_position
         in_exit_grace = now_ts < exit_grace_until
+
+        limits_ok, limits_reason = enforce_position_limits(len(positions), len(orders), limits)
+        if not limits_ok:
+            print(f"position-limits-breach: {limits_reason}; flattening.")
+            cancel_attempted, close_attempted = broker.flatten(config.account_id)
+            print(f"Flatten: cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
+            time.sleep(tick_poll_idle_sec)
+            continue
 
         quote = rt.last_quote(contract_id)
         trade = rt.last_trade(contract_id)
@@ -214,6 +300,20 @@ def _run_strategy_loop(config: RuntimeConfig, broker, contract_id: str, rt, stra
         else:
             pos_state = PositionState(in_position=False)
 
+        dd = drawdown_guard.update(pos_state, price)
+        if dd.breached and not drawdown_tripped:
+            drawdown_tripped = True
+            print(
+                "drawdown-guard-tripped:"
+                f" drawdown_abs={dd.drawdown_abs:.2f} max={drawdown_guard.max_drawdown_abs:.2f}"
+            )
+        if drawdown_tripped:
+            if in_position and not in_exit_grace:
+                cancel_attempted, close_attempted = broker.flatten(config.account_id)
+                print(f"drawdown-flatten: cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
+            time.sleep(poll_sleep_sec)
+            continue
+
         tick_handler = getattr(strategy, "on_tick", None)
         should_run_tick_handler = callable(tick_handler) and (setup_armed or in_position)
         if should_run_tick_handler:
@@ -227,13 +327,15 @@ def _run_strategy_loop(config: RuntimeConfig, broker, contract_id: str, rt, stra
                 cancel_attempted, close_attempted = broker.flatten(config.account_id)
                 print(f"strategy-tick-exit flatten: cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
             elif tick_decision.should_enter and (not in_position) and (not orders) and (not in_exit_grace):
+                sl_ticks = int(tick_decision.sl_ticks_abs) if tick_decision.sl_ticks_abs else int(config.sl_ticks)
+                tp_ticks = int(tick_decision.tp_ticks_abs) if tick_decision.tp_ticks_abs else int(config.tp_ticks)
                 response = broker.place_market_with_brackets(
                     account_id=config.account_id,
                     contract_id=contract_id,
                     side=tick_decision.side if tick_decision.side in (0, 1) else BUY,
                     size=max(1, int(tick_decision.size)),
-                    sl_ticks_abs=config.sl_ticks,
-                    tp_ticks_abs=config.tp_ticks,
+                    sl_ticks_abs=max(1, sl_ticks),
+                    tp_ticks_abs=max(1, tp_ticks),
                 )
                 print(f"strategy-tick-entry {tick_decision.reason}:", response)
                 if not response.get("success"):
@@ -254,13 +356,15 @@ def _run_strategy_loop(config: RuntimeConfig, broker, contract_id: str, rt, stra
                 cancel_attempted, close_attempted = broker.flatten(config.account_id)
                 print(f"strategy-exit flatten: cancel_attempted={cancel_attempted} close_attempted={close_attempted}")
             elif decision.should_enter and (not in_position) and (not orders) and (not in_exit_grace):
+                sl_ticks = int(decision.sl_ticks_abs) if decision.sl_ticks_abs else int(config.sl_ticks)
+                tp_ticks = int(decision.tp_ticks_abs) if decision.tp_ticks_abs else int(config.tp_ticks)
                 response = broker.place_market_with_brackets(
                     account_id=config.account_id,
                     contract_id=contract_id,
                     side=decision.side if decision.side in (0, 1) else BUY,
                     size=max(1, int(decision.size)),
-                    sl_ticks_abs=config.sl_ticks,
-                    tp_ticks_abs=config.tp_ticks,
+                    sl_ticks_abs=max(1, sl_ticks),
+                    tp_ticks_abs=max(1, tp_ticks),
                 )
                 print(f"strategy-entry {decision.reason}:", response)
                 if not response.get("success"):

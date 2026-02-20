@@ -11,6 +11,8 @@ class StrategyDecision:
     side: int
     size: int
     reason: str
+    sl_ticks_abs: int | None = None
+    tp_ticks_abs: int | None = None
 
 
 @dataclass(frozen=True)

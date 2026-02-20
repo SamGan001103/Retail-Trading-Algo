@@ -34,6 +34,14 @@ def test_outside_session_flat_no_entry():
 
 
 def test_tick_mode_arms_setup_on_bar_then_enters_on_tick():
+    class _Plan:
+        def __init__(self, setup):
+            self.setup = setup
+            self.size = 2
+            self.sl_ticks_abs = 12
+            self.tp_ticks_abs = 48
+            self.ml_score = 0.9
+
     strategy = NYSessionMarketStructureStrategy(
         entry_mode="tick",
         require_orderflow=False,
@@ -56,6 +64,7 @@ def test_tick_mode_arms_setup_on_bar_then_enters_on_tick():
     )
     strategy._setup_ready = lambda setup: setup.side == BUY  # type: ignore[attr-defined]
     strategy._tick_entry_ready = lambda side: side == BUY  # type: ignore[attr-defined]
+    strategy._build_entry_risk_plan = lambda setup, **kwargs: _Plan(setup)  # type: ignore[attr-defined]
 
     bar_decision = strategy.on_bar(
         bar=_bar("2026-01-15T14:31:00Z", 100, 101, 99, 100),
@@ -74,6 +83,9 @@ def test_tick_mode_arms_setup_on_bar_then_enters_on_tick():
     )
     assert tick_decision.should_enter is True
     assert tick_decision.side == BUY
+    assert tick_decision.size == 2
+    assert tick_decision.sl_ticks_abs == 12
+    assert tick_decision.tp_ticks_abs == 48
     assert tick_decision.reason == "entry-orderflow-sniper"
     assert strategy.pending_setup() is None
 
@@ -112,5 +124,5 @@ def test_tick_mode_setup_is_rejected_when_ml_gate_denies():
         position=PositionState(in_position=False),
     )
     assert decision.should_enter is False
-    assert decision.reason == "flat-ml-reject"
+    assert decision.reason.startswith("flat-ml-reject:")
     assert strategy.pending_setup() is None

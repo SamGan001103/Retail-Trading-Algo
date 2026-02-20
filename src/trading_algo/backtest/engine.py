@@ -11,6 +11,8 @@ class BacktestConfig:
     initial_cash: float = 10_000.0
     fee_per_order: float = 1.0
     slippage_bps: float = 1.0
+    tick_size: float = 0.25
+    max_drawdown_abs: float | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,60 @@ def _trade_pnl(side: int, size: int, entry: float, exit_price: float, fee_per_or
     return gross - fees
 
 
+def _bracket_levels(
+    side: int,
+    entry_price: float,
+    sl_ticks_abs: int | None,
+    tp_ticks_abs: int | None,
+    tick_size: float,
+) -> tuple[float | None, float | None]:
+    if tick_size <= 0:
+        return None, None
+    sl = abs(int(sl_ticks_abs)) if sl_ticks_abs else 0
+    tp = abs(int(tp_ticks_abs)) if tp_ticks_abs else 0
+    sl_price = None
+    tp_price = None
+    if side == BUY:
+        if sl > 0:
+            sl_price = entry_price - sl * tick_size
+        if tp > 0:
+            tp_price = entry_price + tp * tick_size
+    else:
+        if sl > 0:
+            sl_price = entry_price + sl * tick_size
+        if tp > 0:
+            tp_price = entry_price - tp * tick_size
+    return sl_price, tp_price
+
+
+def _protective_exit_price(
+    side: int,
+    bar: MarketBar,
+    sl_price: float | None,
+    tp_price: float | None,
+) -> tuple[float, str] | None:
+    if side == BUY:
+        sl_hit = sl_price is not None and bar.low <= sl_price
+        tp_hit = tp_price is not None and bar.high >= tp_price
+        if sl_hit and tp_hit:
+            return float(sl_price), "stop-loss"
+        if sl_hit:
+            return float(sl_price), "stop-loss"
+        if tp_hit:
+            return float(tp_price), "take-profit"
+        return None
+
+    sl_hit = sl_price is not None and bar.high >= sl_price
+    tp_hit = tp_price is not None and bar.low <= tp_price
+    if sl_hit and tp_hit:
+        return float(sl_price), "stop-loss"
+    if sl_hit:
+        return float(sl_price), "stop-loss"
+    if tp_hit:
+        return float(tp_price), "take-profit"
+    return None
+
+
 def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConfig) -> BacktestResult:
     cash = float(config.initial_cash)
     equity = cash
@@ -61,9 +117,51 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
     entry_price = 0.0
     entry_ts = ""
     bars_in_position = 0
+    sl_price: float | None = None
+    tp_price: float | None = None
+    trading_halted = False
     trades: list[ExecutedTrade] = []
 
     for idx, bar in enumerate(bars):
+        if in_position and side is not None:
+            protective = _protective_exit_price(side, bar, sl_price, tp_price)
+            if protective is not None:
+                protective_price, _reason = protective
+                exit_price = _apply_slippage(protective_price, side, config.slippage_bps, is_entry=False)
+                pnl = _trade_pnl(side, size, entry_price, exit_price, config.fee_per_order)
+                cash += pnl
+                trades.append(
+                    ExecutedTrade(
+                        entry_ts=entry_ts,
+                        exit_ts=bar.ts,
+                        side=side,
+                        size=size,
+                        entry_price=entry_price,
+                        exit_price=exit_price,
+                        pnl=pnl,
+                    )
+                )
+                in_position = False
+                side = None
+                size = 0
+                entry_price = 0.0
+                entry_ts = ""
+                bars_in_position = 0
+                sl_price = None
+                tp_price = None
+
+                equity = cash
+                peak_equity = max(peak_equity, equity)
+                if peak_equity > 0:
+                    drawdown = (peak_equity - equity) / peak_equity
+                    max_drawdown = max(max_drawdown, drawdown)
+                if config.max_drawdown_abs is not None and config.max_drawdown_abs > 0:
+                    if (peak_equity - equity) >= config.max_drawdown_abs:
+                        trading_halted = True
+
+        if trading_halted:
+            continue
+
         context = StrategyContext(index=idx, total_bars=len(bars))
         position = PositionState(
             in_position=in_position,
@@ -81,6 +179,13 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
             entry_ts = bar.ts
             in_position = True
             bars_in_position = 0
+            sl_price, tp_price = _bracket_levels(
+                side=side,
+                entry_price=entry_price,
+                sl_ticks_abs=decision.sl_ticks_abs,
+                tp_ticks_abs=decision.tp_ticks_abs,
+                tick_size=config.tick_size,
+            )
         elif in_position and decision.should_exit and side is not None:
             exit_price = _apply_slippage(bar.close, side, config.slippage_bps, is_entry=False)
             pnl = _trade_pnl(side, size, entry_price, exit_price, config.fee_per_order)
@@ -102,6 +207,8 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
             entry_price = 0.0
             entry_ts = ""
             bars_in_position = 0
+            sl_price = None
+            tp_price = None
         elif in_position:
             bars_in_position += 1
 
@@ -115,6 +222,33 @@ def run_backtest(bars: list[MarketBar], strategy: Strategy, config: BacktestConf
         if peak_equity > 0:
             drawdown = (peak_equity - equity) / peak_equity
             max_drawdown = max(max_drawdown, drawdown)
+        if config.max_drawdown_abs is not None and config.max_drawdown_abs > 0:
+            if (peak_equity - equity) >= config.max_drawdown_abs:
+                trading_halted = True
+                if in_position and side is not None:
+                    exit_price = _apply_slippage(bar.close, side, config.slippage_bps, is_entry=False)
+                    pnl = _trade_pnl(side, size, entry_price, exit_price, config.fee_per_order)
+                    cash += pnl
+                    trades.append(
+                        ExecutedTrade(
+                            entry_ts=entry_ts,
+                            exit_ts=bar.ts,
+                            side=side,
+                            size=size,
+                            entry_price=entry_price,
+                            exit_price=exit_price,
+                            pnl=pnl,
+                        )
+                    )
+                    in_position = False
+                    side = None
+                    size = 0
+                    entry_price = 0.0
+                    entry_ts = ""
+                    bars_in_position = 0
+                    sl_price = None
+                    tp_price = None
+                    equity = cash
 
     if in_position and side is not None:
         last = bars[-1]

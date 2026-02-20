@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections import deque
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from trading_algo.core import BUY, SELL
+from trading_algo.position_management import StopLossPlanner, TakeProfitPlanner
 from trading_algo.strategy.base import MarketBar, PositionState, Strategy, StrategyContext, StrategyDecision
 
 from .swing_points import SwingPointsDetector
@@ -30,6 +32,27 @@ class SetupEnvironment:
     fib_retracement: bool
     key_area_proximity: bool
     confluence_score: int
+
+
+@dataclass(frozen=True)
+class SetupMLDecision:
+    approved: bool
+    score: float | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class PlannedEntry:
+    setup: SetupEnvironment
+    size: int
+    sl_ticks_abs: int
+    tp_ticks_abs: int
+    stop_level: float
+    target_level: float
+    rrr: float
+    stop_order_type: str
+    take_profit_order_type: str
+    ml_score: float | None
 
 
 @dataclass(frozen=True)
@@ -263,6 +286,21 @@ class NYSessionMarketStructureStrategy(Strategy):
     tick_spoof_collapse_ratio: float = 0.35
     tick_absorption_min_trades: int = 2
     tick_iceberg_min_reloads: int = 2
+    symbol: str = "MNQ"
+    tick_size: float = 0.25
+    tick_value: float = 0.5
+    account_max_drawdown: float = 2_500.0
+    max_trade_drawdown_fraction: float = 0.15
+    risk_min_rrr: float = 3.0
+    risk_max_rrr: float = 10.0
+    sl_noise_buffer_ticks: int = 2
+    sl_max_ticks: int = 200
+    tp_front_run_ticks: int = 2
+    dom_liquidity_wall_size: float = 800.0
+    ml_min_size_fraction: float = 0.35
+    ml_size_floor_score: float = 0.55
+    ml_size_ceiling_score: float = 0.90
+    enable_exhaustion_market_exit: bool = True
     orderflow_filter: OrderFlowFilter | None = None
 
     _session: SessionWindow = field(init=False, repr=False)
@@ -274,10 +312,13 @@ class NYSessionMarketStructureStrategy(Strategy):
     _last_ltf_trend: Trend = field(default="neutral", init=False, repr=False)
     _last_sweep_side: int | None = field(default=None, init=False, repr=False)
     _last_sweep_index: int | None = field(default=None, init=False, repr=False)
+    _last_sweep_price: float | None = field(default=None, init=False, repr=False)
     _orderflow_state: OrderFlowState = field(default_factory=OrderFlowState, init=False, repr=False)
-    _pending_setup: SetupEnvironment | None = field(default=None, init=False, repr=False)
+    _pending_setup: PlannedEntry | None = field(default=None, init=False, repr=False)
     _tick_samples: deque[TickFlowSample] = field(init=False, repr=False)
     _ml_gate: SetupApprovalGate | None = field(default=None, init=False, repr=False)
+    _stop_planner: StopLossPlanner = field(init=False, repr=False)
+    _take_profit_planner: TakeProfitPlanner = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.size < 1:
@@ -292,6 +333,30 @@ class NYSessionMarketStructureStrategy(Strategy):
             raise ValueError("tick_setup_expiry_bars must be >= 1")
         if self.tick_history_size < 20:
             raise ValueError("tick_history_size must be >= 20")
+        if self.tick_size <= 0:
+            raise ValueError("tick_size must be > 0")
+        if self.tick_value <= 0:
+            raise ValueError("tick_value must be > 0")
+        if self.account_max_drawdown <= 0:
+            raise ValueError("account_max_drawdown must be > 0")
+        if not (0 < self.max_trade_drawdown_fraction <= 1):
+            raise ValueError("max_trade_drawdown_fraction must be in (0, 1]")
+        if self.risk_min_rrr <= 0:
+            raise ValueError("risk_min_rrr must be > 0")
+        if self.risk_max_rrr < self.risk_min_rrr:
+            raise ValueError("risk_max_rrr must be >= risk_min_rrr")
+        if self.sl_noise_buffer_ticks < 0:
+            raise ValueError("sl_noise_buffer_ticks must be >= 0")
+        if self.sl_max_ticks < 1:
+            raise ValueError("sl_max_ticks must be >= 1")
+        if self.tp_front_run_ticks < 0:
+            raise ValueError("tp_front_run_ticks must be >= 0")
+        if self.dom_liquidity_wall_size < 0:
+            raise ValueError("dom_liquidity_wall_size must be >= 0")
+        if not (0 < self.ml_min_size_fraction <= 1):
+            raise ValueError("ml_min_size_fraction must be in (0, 1]")
+        if not (0 <= self.ml_size_floor_score <= 1 and 0 <= self.ml_size_ceiling_score <= 1):
+            raise ValueError("ml_size_floor_score and ml_size_ceiling_score must be in [0, 1]")
         mode = self.entry_mode.strip().lower()
         if mode not in {"bar", "tick"}:
             raise ValueError("entry_mode must be 'bar' or 'tick'")
@@ -317,6 +382,18 @@ class NYSessionMarketStructureStrategy(Strategy):
                 DepthImbalanceOrderFlowFilter() if self.require_orderflow else AllowAllOrderFlowFilter()
             )
         self._tick_samples = deque(maxlen=self.tick_history_size)
+        self._stop_planner = StopLossPlanner(
+            tick_size=self.tick_size,
+            noise_buffer_ticks=self.sl_noise_buffer_ticks,
+            min_stop_ticks=2,
+            max_stop_ticks=self.sl_max_ticks,
+        )
+        self._take_profit_planner = TakeProfitPlanner(
+            tick_size=self.tick_size,
+            min_rrr=self.risk_min_rrr,
+            max_rrr=self.risk_max_rrr,
+            front_run_ticks=self.tp_front_run_ticks,
+        )
 
     def set_orderflow_state(self, flow: OrderFlowState) -> None:
         self._orderflow_state = flow
@@ -325,7 +402,9 @@ class NYSessionMarketStructureStrategy(Strategy):
         self._ml_gate = ml_gate
 
     def pending_setup(self) -> SetupEnvironment | None:
-        return self._pending_setup
+        if self._pending_setup is None:
+            return None
+        return self._pending_setup.setup
 
     def is_in_session(self, ts: str) -> bool:
         return self._session.contains(ts)
@@ -371,8 +450,8 @@ class NYSessionMarketStructureStrategy(Strategy):
                 should_enter=False,
                 side=position.side if position.side is not None else BUY,
                 size=position.size,
-                    reason="hold",
-                )
+                reason="hold",
+            )
 
         if not in_session:
             self._pending_setup = None
@@ -415,29 +494,40 @@ class NYSessionMarketStructureStrategy(Strategy):
             )
 
         chosen = long_setup if long_ready else short_setup
-        if not self._ml_allows_setup(chosen):
+        ml_decision = self._evaluate_ml(chosen)
+        if not ml_decision.approved:
             self._pending_setup = None
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
                 side=chosen.side,
                 size=self.size,
-                reason="flat-ml-reject",
+                reason=f"flat-ml-reject:{ml_decision.reason}",
             )
-
-        if self.entry_mode == "tick":
-            self._pending_setup = chosen
+        entry_plan = self._build_entry_risk_plan(chosen, ml_score=ml_decision.score)
+        if entry_plan is None:
+            self._pending_setup = None
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
                 side=chosen.side,
                 size=self.size,
+                reason="flat-risk-invalid",
+            )
+
+        if self.entry_mode == "tick":
+            self._pending_setup = entry_plan
+            return StrategyDecision(
+                should_exit=False,
+                should_enter=False,
+                side=entry_plan.setup.side,
+                size=entry_plan.size,
                 reason="setup-armed-tick",
             )
 
         if self.require_orderflow and self.orderflow_filter is not None:
             if not self.orderflow_filter.allow_entry(
-                side=chosen.side,
+                side=entry_plan.setup.side,
                 bar=bar,
                 context=context,
                 flow=self._orderflow_state,
@@ -445,17 +535,19 @@ class NYSessionMarketStructureStrategy(Strategy):
                 return StrategyDecision(
                     should_exit=False,
                     should_enter=False,
-                    side=chosen.side,
-                    size=self.size,
+                    side=entry_plan.setup.side,
+                    size=entry_plan.size,
                     reason="flat-orderflow-gate",
                 )
 
         return StrategyDecision(
             should_exit=False,
             should_enter=True,
-            side=chosen.side,
-            size=self.size,
+            side=entry_plan.setup.side,
+            size=entry_plan.size,
             reason="entry-ny-structure-bar",
+            sl_ticks_abs=entry_plan.sl_ticks_abs,
+            tp_ticks_abs=entry_plan.tp_ticks_abs,
         )
 
     def on_tick(self, ts: str, price: float, context: StrategyContext, position: PositionState) -> StrategyDecision:
@@ -470,17 +562,27 @@ class NYSessionMarketStructureStrategy(Strategy):
 
         if position.in_position:
             self._pending_setup = None
+            self._record_tick_sample(ts, price)
+            side = position.side if position.side is not None else BUY
+            if self.enable_exhaustion_market_exit and self._tick_exhaustion_exit_signal(side):
+                return StrategyDecision(
+                    should_exit=True,
+                    should_enter=False,
+                    side=side,
+                    size=position.size if position.size > 0 else self.size,
+                    reason="tick-exhaustion-market-exit",
+                )
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
-                side=position.side if position.side is not None else BUY,
+                side=side,
                 size=position.size if position.size > 0 else self.size,
                 reason="tick-hold-position",
             )
 
         self._expire_pending_setup(context.index)
-        setup = self._pending_setup
-        if setup is None:
+        planned = self._pending_setup
+        if planned is None:
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
@@ -493,8 +595,8 @@ class NYSessionMarketStructureStrategy(Strategy):
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
-                side=setup.side,
-                size=self.size,
+                side=planned.setup.side,
+                size=planned.size,
                 reason="tick-outside-session",
             )
 
@@ -510,7 +612,7 @@ class NYSessionMarketStructureStrategy(Strategy):
         )
         if self.require_orderflow and self.orderflow_filter is not None:
             if not self.orderflow_filter.allow_entry(
-                side=setup.side,
+                side=planned.setup.side,
                 bar=tick_bar,
                 context=context,
                 flow=self._orderflow_state,
@@ -518,26 +620,38 @@ class NYSessionMarketStructureStrategy(Strategy):
                 return StrategyDecision(
                     should_exit=False,
                     should_enter=False,
-                    side=setup.side,
-                    size=self.size,
+                    side=planned.setup.side,
+                    size=planned.size,
                     reason="tick-orderflow-gate",
                 )
-        if not self._tick_entry_ready(setup.side):
+        if not self._tick_entry_ready(planned.setup.side):
             return StrategyDecision(
                 should_exit=False,
                 should_enter=False,
-                side=setup.side,
-                size=self.size,
+                side=planned.setup.side,
+                size=planned.size,
                 reason="tick-wait-micro-timing",
+            )
+
+        refreshed_plan = self._build_entry_risk_plan(planned.setup, ml_score=planned.ml_score, entry_price=price)
+        if refreshed_plan is None:
+            return StrategyDecision(
+                should_exit=False,
+                should_enter=False,
+                side=planned.setup.side,
+                size=planned.size,
+                reason="tick-risk-invalidated",
             )
 
         self._pending_setup = None
         return StrategyDecision(
             should_exit=False,
             should_enter=True,
-            side=setup.side,
-            size=self.size,
+            side=refreshed_plan.setup.side,
+            size=refreshed_plan.size,
             reason="entry-orderflow-sniper",
+            sl_ticks_abs=refreshed_plan.sl_ticks_abs,
+            tp_ticks_abs=refreshed_plan.tp_ticks_abs,
         )
 
     def _build_setup_environment(
@@ -583,16 +697,173 @@ class NYSessionMarketStructureStrategy(Strategy):
             return False
         return setup.confluence_score >= self.min_confluence_score
 
-    def _ml_allows_setup(self, setup: SetupEnvironment) -> bool:
+    def _evaluate_ml(self, setup: SetupEnvironment) -> SetupMLDecision:
         if self._ml_gate is None:
-            return True
-        approved, _score, _reason = self._ml_gate.evaluate(setup)
-        return bool(approved)
+            return SetupMLDecision(approved=True, score=None, reason="ml-disabled")
+        approved, score, reason = self._ml_gate.evaluate(setup)
+        return SetupMLDecision(approved=bool(approved), score=score, reason=reason)
+
+    def _build_entry_risk_plan(
+        self,
+        setup: SetupEnvironment,
+        ml_score: float | None,
+        entry_price: float | None = None,
+    ) -> PlannedEntry | None:
+        planned_entry_price = setup.close if entry_price is None else float(entry_price)
+        invalidation_levels = self._candidate_invalidation_levels(setup.side)
+        stop_plan = self._stop_planner.plan(
+            side=setup.side,
+            entry_price=planned_entry_price,
+            invalidation_levels=invalidation_levels,
+        )
+        if stop_plan is None:
+            return None
+
+        target_levels = self._candidate_target_levels(setup.side)
+        take_profit_plan = self._take_profit_planner.plan(
+            side=setup.side,
+            entry_price=planned_entry_price,
+            risk_ticks=stop_plan.ticks,
+            target_levels=target_levels,
+        )
+        if take_profit_plan is None:
+            return None
+
+        size = self._size_from_risk_and_ml(stop_plan.ticks, ml_score)
+        if size < 1:
+            return None
+
+        return PlannedEntry(
+            setup=setup,
+            size=size,
+            sl_ticks_abs=stop_plan.ticks,
+            tp_ticks_abs=take_profit_plan.ticks,
+            stop_level=stop_plan.level,
+            target_level=take_profit_plan.level,
+            rrr=take_profit_plan.rrr,
+            stop_order_type=stop_plan.order_type,
+            take_profit_order_type=take_profit_plan.order_type,
+            ml_score=ml_score,
+        )
+
+    def _candidate_invalidation_levels(self, side: int) -> list[float]:
+        levels: list[float] = []
+        if side == BUY:
+            levels.extend(price for _, price in self._ltf_lows_only()[-6:])
+            if self._htf_detector.current_low is not None:
+                levels.append(self._htf_detector.current_low.price)
+            levels.extend(level.price for level in self._htf_detector.past_lows[-6:])
+            if self._last_sweep_side == BUY and self._last_sweep_price is not None:
+                levels.append(self._last_sweep_price)
+            support_level = self._dom_support_liquidity_level(side)
+            if support_level is not None:
+                levels.append(support_level)
+        else:
+            levels.extend(price for _, price in self._ltf_highs_only()[-6:])
+            if self._htf_detector.current_high is not None:
+                levels.append(self._htf_detector.current_high.price)
+            levels.extend(level.price for level in self._htf_detector.past_highs[-6:])
+            if self._last_sweep_side == SELL and self._last_sweep_price is not None:
+                levels.append(self._last_sweep_price)
+            support_level = self._dom_support_liquidity_level(side)
+            if support_level is not None:
+                levels.append(support_level)
+        return levels
+
+    def _candidate_target_levels(self, side: int) -> list[float]:
+        levels: list[float] = []
+        if side == BUY:
+            levels.extend(price for _, price in self._ltf_highs_only()[-8:])
+            if self._htf_detector.current_high is not None:
+                levels.append(self._htf_detector.current_high.price)
+            levels.extend(level.price for level in self._htf_detector.past_highs[-8:])
+            opposing = self._dom_opposing_liquidity_level(side)
+            if opposing is not None:
+                levels.append(opposing)
+        else:
+            levels.extend(price for _, price in self._ltf_lows_only()[-8:])
+            if self._htf_detector.current_low is not None:
+                levels.append(self._htf_detector.current_low.price)
+            levels.extend(level.price for level in self._htf_detector.past_lows[-8:])
+            opposing = self._dom_opposing_liquidity_level(side)
+            if opposing is not None:
+                levels.append(opposing)
+        return levels
+
+    def _dom_support_liquidity_level(self, side: int) -> float | None:
+        levels = self._orderflow_state.depth.get("bids") if side == BUY and self._orderflow_state.depth else None
+        if side == SELL and self._orderflow_state.depth:
+            levels = self._orderflow_state.depth.get("asks")
+        return self._pick_largest_depth_level(levels)
+
+    def _dom_opposing_liquidity_level(self, side: int) -> float | None:
+        levels = self._orderflow_state.depth.get("asks") if side == BUY and self._orderflow_state.depth else None
+        if side == SELL and self._orderflow_state.depth:
+            levels = self._orderflow_state.depth.get("bids")
+        return self._pick_largest_depth_level(levels)
+
+    def _pick_largest_depth_level(self, levels: Any) -> float | None:
+        if not isinstance(levels, list) or not levels:
+            return None
+        best_price: float | None = None
+        best_size = max(0.0, self.dom_liquidity_wall_size)
+        for level in levels[:10]:
+            if not isinstance(level, dict):
+                continue
+            price = _num(level, "price", "p")
+            size = _num(level, "size", "qty", "q")
+            if price is None or size is None:
+                continue
+            if size < self.dom_liquidity_wall_size:
+                continue
+            if best_price is None or size > best_size:
+                best_price = float(price)
+                best_size = float(size)
+        return best_price
+
+    def _size_from_risk_and_ml(self, stop_ticks: int, ml_score: float | None) -> int:
+        if stop_ticks <= 0:
+            return 0
+        per_contract_risk = stop_ticks * self.tick_value
+        if per_contract_risk <= 0:
+            return 0
+        risk_budget = self.account_max_drawdown * self.max_trade_drawdown_fraction
+        if risk_budget <= 0:
+            return 0
+
+        max_contracts = int(math.floor(risk_budget / per_contract_risk))
+        if max_contracts < 1:
+            return 0
+        max_contracts = min(max_contracts, self.size)
+        if max_contracts < 1:
+            return 0
+
+        if ml_score is None:
+            return max_contracts
+
+        score = self._clamp01(ml_score)
+        floor_score = min(self.ml_size_floor_score, self.ml_size_ceiling_score)
+        ceil_score = max(self.ml_size_floor_score, self.ml_size_ceiling_score)
+        if ceil_score - floor_score < 1e-9:
+            fraction = 1.0 if score >= ceil_score else self.ml_min_size_fraction
+        elif score <= floor_score:
+            fraction = self.ml_min_size_fraction
+        elif score >= ceil_score:
+            fraction = 1.0
+        else:
+            ratio = (score - floor_score) / (ceil_score - floor_score)
+            fraction = self.ml_min_size_fraction + ratio * (1.0 - self.ml_min_size_fraction)
+        sized = int(math.floor(max_contracts * fraction))
+        return max(1, min(max_contracts, sized))
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
 
     def _expire_pending_setup(self, bar_index: int) -> None:
         if self._pending_setup is None:
             return
-        if (bar_index - self._pending_setup.index) > self.tick_setup_expiry_bars:
+        if (bar_index - self._pending_setup.setup.index) > self.tick_setup_expiry_bars:
             self._pending_setup = None
 
     def _record_tick_sample(self, ts: str, price: float) -> None:
@@ -698,6 +969,40 @@ class NYSessionMarketStructureStrategy(Strategy):
             return mids[-1] > mids[-3]
         return mids[-1] < mids[-3]
 
+    def _tick_exhaustion_exit_signal(self, side: int) -> bool:
+        window = list(self._tick_samples)[-12:]
+        if len(window) < 6:
+            return False
+        aggressive_buy = 0.0
+        aggressive_sell = 0.0
+        eps = 1e-9
+        for sample in window:
+            if sample.trade_price is None or sample.trade_size <= 0:
+                continue
+            if sample.ask is not None and sample.trade_price >= (sample.ask - eps):
+                aggressive_buy += sample.trade_size
+            elif sample.bid is not None and sample.trade_price <= (sample.bid + eps):
+                aggressive_sell += sample.trade_size
+
+        mids = [s.mid for s in window if s.mid is not None]
+        if len(mids) < 2:
+            return False
+        progress = mids[-1] - mids[0]
+        latest_imbalance = window[-1].imbalance
+        if latest_imbalance is None:
+            return False
+
+        if side == BUY:
+            buying_aggression = aggressive_buy > aggressive_sell * 1.15
+            no_advance = progress <= self.tick_size
+            imbalance_flip = latest_imbalance < -abs(self.tick_min_imbalance)
+            return buying_aggression and (no_advance or imbalance_flip)
+
+        selling_aggression = aggressive_sell > aggressive_buy * 1.15
+        no_advance = progress >= -self.tick_size
+        imbalance_flip = latest_imbalance > abs(self.tick_min_imbalance)
+        return selling_aggression and (no_advance or imbalance_flip)
+
     def _update_htf(self, bar: MarketBar, index: int) -> None:
         self._htf_buffer.append(bar)
         if len(self._htf_buffer) < self.htf_aggregation:
@@ -710,9 +1015,11 @@ class NYSessionMarketStructureStrategy(Strategy):
         if sweep_high:
             self._last_sweep_side = SELL
             self._last_sweep_index = index
+            self._last_sweep_price = htf_bar.high
         elif sweep_low:
             self._last_sweep_side = BUY
             self._last_sweep_index = index
+            self._last_sweep_price = htf_bar.low
 
     def _aggregate_bars(self, bars: list[MarketBar]) -> MarketBar:
         first = bars[0]
@@ -798,16 +1105,6 @@ class NYSessionMarketStructureStrategy(Strategy):
         if self._last_sweep_side != side:
             return False
         return (index - self._last_sweep_index) <= self.sweep_expiry_bars
-
-    def _confluence_score(self, side: int, close: float) -> int:
-        score = 0
-        if self._equal_levels(side):
-            score += 1
-        if self._fib_retracement_confluence(side, close):
-            score += 1
-        if self._key_area_proximity(side, close):
-            score += 1
-        return score
 
     def _equal_levels(self, side: int) -> bool:
         points = self._ltf_lows_only() if side == BUY else self._ltf_highs_only()

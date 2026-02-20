@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 
 from trading_algo.backtest import BacktestConfig, load_bars_from_csv, run_backtest as run_backtest_sim
-from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, load_runtime_config, must_env
+from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, get_symbol_profile, load_runtime_config, must_env
 from trading_algo.ml import SetupMLGate, train_xgboost_from_csv
 from trading_algo.runtime.bot_runtime import run as run_forward_runtime
 from trading_algo.strategy import NYSessionMarketStructureStrategy, OneShotLongStrategy
@@ -25,6 +25,9 @@ def _strategy_from_name(name: str, hold_bars: int, *, for_forward: bool):
         return OneShotLongStrategy(hold_bars=hold_bars)
     if key in {"ny_structure", "ny_session", "market_structure", "mnq_ny"}:
         entry_mode_default = "tick" if for_forward else "bar"
+        symbol = (os.getenv("SYMBOL") or "MNQ").strip().upper()
+        profile = get_symbol_profile(symbol)
+        sizing_drawdown = env_float("STRAT_ACCOUNT_MAX_DRAWDOWN", env_float("ACCOUNT_MAX_DRAWDOWN", 2_500.0))
         strategy = NYSessionMarketStructureStrategy(
             size=env_int("SIZE", 1),
             session_start=(os.getenv("STRAT_NY_SESSION_START") or "09:30").strip(),
@@ -50,6 +53,21 @@ def _strategy_from_name(name: str, hold_bars: int, *, for_forward: bool):
             tick_spoof_collapse_ratio=env_float("STRAT_TICK_SPOOF_COLLAPSE", 0.35),
             tick_absorption_min_trades=env_int("STRAT_TICK_ABSORPTION_TRADES", 2),
             tick_iceberg_min_reloads=env_int("STRAT_TICK_ICEBERG_RELOADS", 2),
+            symbol=symbol,
+            tick_size=env_float("STRAT_TICK_SIZE", profile.tick_size),
+            tick_value=env_float("STRAT_TICK_VALUE", profile.tick_value),
+            account_max_drawdown=sizing_drawdown,
+            max_trade_drawdown_fraction=env_float("STRAT_MAX_TRADE_DRAWDOWN_FRACTION", 0.15),
+            risk_min_rrr=env_float("STRAT_MIN_RRR", 3.0),
+            risk_max_rrr=env_float("STRAT_MAX_RRR", 10.0),
+            sl_noise_buffer_ticks=env_int("STRAT_SL_NOISE_BUFFER_TICKS", 2),
+            sl_max_ticks=env_int("STRAT_SL_MAX_TICKS", 200),
+            tp_front_run_ticks=env_int("STRAT_TP_FRONT_RUN_TICKS", 2),
+            dom_liquidity_wall_size=env_float("STRAT_DOM_LIQUIDITY_WALL_SIZE", profile.dom_liquidity_wall_size),
+            ml_min_size_fraction=env_float("STRAT_ML_MIN_SIZE_FRACTION", 0.35),
+            ml_size_floor_score=env_float("STRAT_ML_SIZE_FLOOR_SCORE", 0.55),
+            ml_size_ceiling_score=env_float("STRAT_ML_SIZE_CEILING_SCORE", 0.90),
+            enable_exhaustion_market_exit=env_bool("STRAT_ENABLE_EXHAUSTION_MARKET_EXIT", True),
         )
         if env_bool("STRAT_ML_GATE_ENABLED", False):
             strategy.set_ml_gate(
@@ -91,10 +109,15 @@ def run_forward(config: RuntimeConfig, strategy_name: str, hold_bars: int) -> No
 def run_backtest(data_csv: str, strategy_name: str, hold_bars: int) -> None:
     bars = load_bars_from_csv(data_csv)
     strategy = _strategy_from_name(strategy_name, hold_bars, for_forward=False)
+    symbol = (os.getenv("SYMBOL") or "MNQ").strip().upper()
+    profile = get_symbol_profile(symbol)
+    max_drawdown_abs = env_float("ACCOUNT_MAX_DRAWDOWN_KILLSWITCH", env_float("ACCOUNT_MAX_DRAWDOWN", 0.0))
     cfg = BacktestConfig(
         initial_cash=env_float("BACKTEST_INITIAL_CASH", 10_000.0),
         fee_per_order=env_float("BACKTEST_FEE_PER_ORDER", 1.0),
         slippage_bps=env_float("BACKTEST_SLIPPAGE_BPS", 1.0),
+        tick_size=env_float("STRAT_TICK_SIZE", profile.tick_size),
+        max_drawdown_abs=max_drawdown_abs if max_drawdown_abs > 0 else None,
     )
     result = run_backtest_sim(bars, strategy, cfg)
     print("BACKTEST RESULT")

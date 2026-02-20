@@ -6,6 +6,11 @@ from trading_algo.config.settings import load_runtime_config
 
 def test_load_runtime_config(monkeypatch):
     monkeypatch.setenv("BROKER", "projectx")
+    monkeypatch.delenv("BROKER_BASE_URL", raising=False)
+    monkeypatch.delenv("BROKER_USERNAME", raising=False)
+    monkeypatch.delenv("BROKER_API_KEY", raising=False)
+    monkeypatch.delenv("BROKER_USER_HUB_URL", raising=False)
+    monkeypatch.delenv("BROKER_MARKET_HUB_URL", raising=False)
     monkeypatch.setenv("PROJECTX_BASE_URL", "https://demo.example.com")
     monkeypatch.setenv("PROJECTX_USERNAME", "u")
     monkeypatch.setenv("PROJECTX_API_KEY", "k")
