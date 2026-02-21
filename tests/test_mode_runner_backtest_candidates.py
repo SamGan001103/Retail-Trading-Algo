@@ -5,6 +5,7 @@ from trading_algo.backtest import OrderFlowTick
 from trading_algo.runtime.mode_runner import (
     _BacktestMatrixTracker,
     _BacktestMatrixCsvWriter,
+    _BacktestSummaryCsvWriter,
     _BacktestCandidateCsvWriter,
     _apply_shadow_ml,
     _build_backtest_scenarios,
@@ -150,6 +151,37 @@ def test_backtest_matrix_csv_writer_rotates_legacy_header(tmp_path: Path):
     out_lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
     assert out_lines[0].startswith("run_id,strategy,scenario_id,window_id,window_start_utc,window_end_utc,window_months")
     assert "cand-new" in out_lines[1]
+
+
+def test_backtest_summary_csv_writer_appends_rows(tmp_path: Path):
+    csv_path = tmp_path / "backtest_summary.csv"
+    writer = _BacktestSummaryCsvWriter(str(csv_path))
+    writer.append(
+        {
+            "run_id": "run-1",
+            "strategy": "ny_structure",
+            "source_csv": "data/day1.csv",
+            "scenario_id": "base",
+            "window_id": "latest_6m",
+            "window_start_utc": "2026-01-01T00:00:00Z",
+            "window_end_utc": "2026-01-02T00:00:00Z",
+            "window_months": 1,
+            "bars": 1000,
+            "num_trades": 22,
+            "final_equity": 10012.5,
+            "net_pnl": 12.5,
+            "return_pct": 0.125,
+            "win_rate_pct": 54.0,
+            "max_drawdown_pct": 1.2,
+            "orderflow_replay": True,
+            "news_blackouts": 2,
+        }
+    )
+    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("run_id,strategy,source_csv,scenario_id,window_id")
+    assert "data/day1.csv" in lines[1]
+    assert ",22," in lines[1]
 
 
 def test_latest_months_window_ticks_keeps_recent_window():

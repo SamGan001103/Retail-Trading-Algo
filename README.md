@@ -17,6 +17,20 @@ Supplemental docs:
 1. `docs/architecture.md`
 2. `docs/roadmap.md`
 
+## 0. Progress Update (2026-02-21)
+
+Current status for Databento backtesting pipeline:
+
+1. End-to-end DBN day replay is working with local downloaded Databento zip data (`.dbn.zst`) using Python 3.11 + `databento` SDK.
+2. Daily batch runner supports both DBN and CSV inputs and processes one day at a time with automatic temp cleanup.
+3. NY strategy backtest path is strategy-only (no ML gate blocking), uses orderflow/tick replay, and strategy-planned SL/TP in execution replay.
+4. Backtest outputs now include:
+   - candidate lifecycle CSV (`artifacts/telemetry/backtest_candidates.csv`)
+   - candidate matrix CSV (`artifacts/telemetry/backtest_candidate_matrix.csv`)
+   - performance summary CSV (`artifacts/telemetry/backtest_summary.csv`)
+5. Verified run example (single day):
+   - `py -3.11 scripts/data/backtest_databento_daily.py --input "C:\Users\User\Downloads\GLBX-20260220-GSMJP896QR.zip" --strategy ny_structure --hold-bars 120 --profile normal --start-day 20260215 --end-day 20260215 --max-days 1 --continue-on-error`
+
 ## 1. User Instructions
 
 ### 1.1 Setup
@@ -39,6 +53,18 @@ Optional train dependency (`--mode train`):
 
 ```bash
 pip install xgboost
+```
+
+Optional Databento DBN import dependency (`mbp-10` batch downloads):
+
+```bash
+pip install databento-dbn
+```
+
+Optional Databento Historical SDK dependency (programmatic batch CSV download):
+
+```bash
+pip install databento
 ```
 
 CLI scripts import `trading_algo` from the `src/` package path. Before running commands, use either:
@@ -155,6 +181,7 @@ BACKTEST_WF_STEP_MONTHS=1
 # BACKTEST_WF_END_UTC=2026-01-01T00:00:00Z
 BACKTEST_CANDIDATES_CSV=artifacts/telemetry/backtest_candidates.csv
 BACKTEST_MATRIX_CSV=artifacts/telemetry/backtest_candidate_matrix.csv
+BACKTEST_SUMMARY_CSV=artifacts/telemetry/backtest_summary.csv
 BACKTEST_BAR_SEC=60
 BACKTEST_SHADOW_ML_ENABLED=false
 BACKTEST_SHADOW_ML_MODEL_PATH=artifacts/models/xgboost_model.json
@@ -203,14 +230,15 @@ Notes:
 9. `BACKTEST_WALK_FORWARD=true` enables rolling windows (`BACKTEST_WF_WINDOW_MONTHS`, `BACKTEST_WF_STEP_MONTHS`) and tags rows with `window_id`.
 10. `BACKTEST_CANDIDATES_CSV` appends candidate lifecycle events for each backtest run.
 11. `BACKTEST_MATRIX_CSV` appends one ML-ready row per candidate with execution outcomes.
-12. `BACKTEST_PREFLIGHT_*` enforces dataset quality checks (required columns, UTC timestamps, `(timestamp,seq)` ordering, quote/depth/session coverage).
-13. `BACKTEST_SLIP_*` and `BACKTEST_SPREAD_SLIP_K` control side-correct quote-based fills in tick replay.
-14. `BACKTEST_ENTRY_DELAY_EVENTS` enforces next-event (or more) entry delay for tick entries.
-15. `BACKTEST_SENSITIVITY_SWEEP=true` runs extra stress scenarios over latency/slippage/spread-slip settings.
-16. `BACKTEST_BAR_SEC` controls bar aggregation during NY tick replay (default: `STRAT_FORWARD_BAR_SEC`, typically `60`).
-17. `STRAT_AVOID_NEWS=true` plus `BACKTEST_NEWS_CSV` enables major-news blackout windows for setup/entry filtering.
-18. `STRAT_TICK_POLL_SEC` is the base fallback poll interval; idle/armed values can override it.
-19. Timeframe mapping uses `STRAT_FORWARD_BAR_SEC` as LTF base. Example shown above: LTF=1m, HTF=15m (`STRAT_HTF_AGGREGATION=15`), bias=1h (`STRAT_BIAS_AGGREGATION=60`).
+12. `BACKTEST_SUMMARY_CSV` appends strategy performance metrics per scenario/window (equity, pnl, return, win rate, drawdown).
+13. `BACKTEST_PREFLIGHT_*` enforces dataset quality checks (required columns, UTC timestamps, `(timestamp,seq)` ordering, quote/depth/session coverage).
+14. `BACKTEST_SLIP_*` and `BACKTEST_SPREAD_SLIP_K` control side-correct quote-based fills in tick replay.
+15. `BACKTEST_ENTRY_DELAY_EVENTS` enforces next-event (or more) entry delay for tick entries.
+16. `BACKTEST_SENSITIVITY_SWEEP=true` runs extra stress scenarios over latency/slippage/spread-slip settings.
+17. `BACKTEST_BAR_SEC` controls bar aggregation during NY tick replay (default: `STRAT_FORWARD_BAR_SEC`, typically `60`).
+18. `STRAT_AVOID_NEWS=true` plus `BACKTEST_NEWS_CSV` enables major-news blackout windows for setup/entry filtering.
+19. `STRAT_TICK_POLL_SEC` is the base fallback poll interval; idle/armed values can override it.
+20. Timeframe mapping uses `STRAT_FORWARD_BAR_SEC` as LTF base. Example shown above: LTF=1m, HTF=15m (`STRAT_HTF_AGGREGATION=15`), bias=1h (`STRAT_BIAS_AGGREGATION=60`).
 
 ### 1.3 Run Commands
 
@@ -277,11 +305,39 @@ ProjectX orderflow CSV capture (realtime stream -> backtest CSV):
 python scripts/data/export_projectx_orderflow.py --symbol MNQ --duration-sec 1800 --output data/mnq_orderflow_capture.csv
 ```
 
+Databento MBP-10 import (batch DBN/.zip -> backtest CSV):
+
+```bash
+python scripts/data/import_databento_orderflow.py --input "C:\Users\User\Downloads\GLBX-20260220-GSMJP896QR.zip" --output data/mnq_databento_orderflow.csv
+```
+
+Databento daily batch backtest from DBN (convert one day -> backtest -> delete temp CSV):
+
+```bash
+python scripts/data/backtest_databento_daily.py --input "C:\Users\User\Downloads\GLBX-20260220-GSMJP896QR.zip" --strategy ny_structure --hold-bars 120 --profile normal --continue-on-error
+```
+
+Databento daily batch backtest from CSV (no DBN decoder dependency):
+
+```bash
+python scripts/data/download_databento_batch_csv.py --start 2026-01-28T00:00:00 --end 2026-02-19T00:00:00 --symbols MNQ.c.0 --output-dir data/databento_daily_csv
+python scripts/data/backtest_databento_daily.py --input "data/databento_daily_csv" --strategy ny_structure --hold-bars 120 --profile normal --continue-on-error
+```
+
+Databento daily batch backtest from pre-existing CSV directory:
+
+```bash
+python scripts/data/backtest_databento_daily.py --input "data/databento_daily_csv" --strategy ny_structure --hold-bars 120 --profile normal --continue-on-error
+```
+
 Notes:
 
 1. This exporter captures realtime stream snapshots (quote/trade/depth), not vendor-side 6-month historical replay.
 2. Set `SUB_DEPTH=true` so market depth is subscribed and written.
 3. For `ny_structure` backtests keep depth enabled (default `--require-depth`).
+4. For very large Databento archives, start with a subset: `--include "*20260218*"` or `--max-files 1`.
+5. Daily batch runner supports DBN and CSV inputs, processes one day at a time, and frees local temp CSV storage by default.
+6. `download_databento_batch_csv.py` can fetch split-by-day CSV batches directly from Databento (`DATABENTO_API_KEY` required).
 
 Train:
 
@@ -325,11 +381,12 @@ Telemetry output files (JSONL append):
 2. Performance/execution: `artifacts/telemetry/performance.jsonl`
 3. Backtest candidate CSV append: `artifacts/telemetry/backtest_candidates.csv` (configurable via `BACKTEST_CANDIDATES_CSV`)
 4. Backtest ML matrix CSV append: `artifacts/telemetry/backtest_candidate_matrix.csv` (configurable via `BACKTEST_MATRIX_CSV`)
-5. Backtest CSV rows now include `scenario_id` and `window_id` tags; candidate rows include `ml_shadow_*` fields when shadow mode is enabled.
-6. If an existing backtest CSV has an older header schema, runtime rotates it to `*.legacy_<UTCSTAMP>.csv` and writes a fresh compatible header.
-7. Forward execution events now include `candidate_id` when available, so candidate features can be joined to entry/exit outcomes for ML labeling.
-8. Forward candidate events include structure/orderflow features such as `has_recent_sweep`, `htf_bias`, `bias_ok`, `continuation`, `reversal`, `equal_levels`, `fib_retracement`, `key_area_proximity`, `confluence_score`, `of_imbalance`, top-of-book sizes/prices, spread, and trade price/size.
-9. Forward labels/outcomes come from execution events in `performance.jsonl` (`strategy_*_entry`, exits/flatten/protective exits) and can be joined on `candidate_id`.
+5. Backtest performance summary CSV append: `artifacts/telemetry/backtest_summary.csv` (configurable via `BACKTEST_SUMMARY_CSV`)
+6. Backtest CSV rows now include `scenario_id` and `window_id` tags; candidate rows include `ml_shadow_*` fields when shadow mode is enabled.
+7. If an existing backtest CSV has an older header schema, runtime rotates it to `*.legacy_<UTCSTAMP>.csv` and writes a fresh compatible header.
+8. Forward execution events now include `candidate_id` when available, so candidate features can be joined to entry/exit outcomes for ML labeling.
+9. Forward candidate events include structure/orderflow features such as `has_recent_sweep`, `htf_bias`, `bias_ok`, `continuation`, `reversal`, `equal_levels`, `fib_retracement`, `key_area_proximity`, `confluence_score`, `of_imbalance`, top-of-book sizes/prices, spread, and trade price/size.
+10. Forward labels/outcomes come from execution events in `performance.jsonl` (`strategy_*_entry`, exits/flatten/protective exits) and can be joined on `candidate_id`.
 
 ### 1.7 Troubleshooting
 
@@ -554,7 +611,7 @@ timestamp,open,high,low,close,volume
 
 Minimum requirements:
 
-1. timestamp column (`timestamp` / `datetime` / `time` / `date`)
+1. timestamp column (`timestamp` / `datetime` / `time` / `date` / `ts_event` / `ts_recv`)
 2. usable price (`trade_price` / `tradePrice` / `price` / `last` / `lastPrice` / `close` / `c`, or `bid` + `ask`)
 3. usable depth on rows used for entry gating:
    - `bestBidSize` + `bestAskSize` (or aliases `bidSize`, `askSize`, `bid_size`, `ask_size`)
@@ -567,6 +624,20 @@ Useful optional columns:
 2. trade size: `trade_size`, `size`, `qty`, `quantity`, `lastSize`, `volume`, `v`
 3. top-of-book prices: `bestBid`, `bestAsk`
 4. event order key aliases: `seq`, `sequence`, `event_seq`, `eventSequence`
+
+Databento MBP CSV compatibility:
+
+1. Supports Databento-style timestamps in nanoseconds (`ts_event`, `ts_recv`) and normalizes to UTC ISO.
+2. Supports top-of-book and depth ladder columns (`bid_px_00`..`bid_px_09`, `ask_px_00`..`ask_px_09`, `bid_sz_*`, `ask_sz_*`).
+3. Supports Databento `sequence` for deterministic replay ordering.
+4. Uses `action` to treat non-trade MBP updates as quote/depth-only rows (trade size stays `0` unless action is trade).
+
+Databento batch downloads (`*.dbn.zst` in a `.zip`) are not consumed directly by runtime.
+Convert them first:
+
+```bash
+python scripts/data/import_databento_orderflow.py --input "C:\Users\User\Downloads\GLBX-20260220-GSMJP896QR.zip" --output data/mnq_databento_orderflow.csv
+```
 
 Execution semantics in NY orderflow backtest:
 

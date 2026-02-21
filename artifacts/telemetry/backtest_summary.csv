@@ -1,0 +1,2 @@
+run_id,strategy,source_csv,scenario_id,window_id,window_start_utc,window_end_utc,window_months,bars,num_trades,final_equity,net_pnl,return_pct,win_rate_pct,max_drawdown_pct,orderflow_replay,news_blackouts
+20260221T082316Z,ny_structure,data\tmp_daily_backtest\orderflow_20260215.csv,base,latest_6m,2025-08-15T23:59:59.991003Z,2026-02-15T23:59:59.991003Z,6,397098,0,10000.0,0.0,0.0,0.0,0.0,True,0

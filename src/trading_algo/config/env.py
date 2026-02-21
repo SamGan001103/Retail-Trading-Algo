@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency fallback
+    def load_dotenv(*_args: object, **_kwargs: object) -> bool:
+        return False
 
 load_dotenv()
 

@@ -186,6 +186,11 @@ def _parse_ts(ts: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _bucket_end_ts(bucket: int, bar_sec: int) -> str:
+    end_ts = datetime.fromtimestamp((int(bucket) + 1) * int(bar_sec), tz=timezone.utc)
+    return end_ts.isoformat().replace("+00:00", "Z")
+
+
 def _num(payload: dict[str, Any] | None, *keys: str) -> float | None:
     if payload is None:
         return None
@@ -742,7 +747,7 @@ def run_backtest_orderflow(
     bar_low: float | None = None
     bar_close: float | None = None
     bar_volume = 0.0
-    bar_ts = replay_ticks[0].ts
+    bar_ts = ""
     bar_index = 0
     snapshot = MarketSnapshot(ts=replay_ticks[0].ts, last_px=float(replay_ticks[0].price), last_sz=float(replay_ticks[0].volume))
     last_tick_price = replay_ticks[0].price
@@ -939,7 +944,8 @@ def run_backtest_orderflow(
                     remaining_events=max(0, int(config.entry_delay_events)),
                 )
                 pending_entry = pending
-                _try_execute_pending(completed.ts, idx, completed.close)
+                fill_ts = snapshot.ts if str(snapshot.ts).strip() != "" else completed.ts
+                _try_execute_pending(fill_ts, idx, completed.close)
 
         if in_position:
             bars_in_position += 1
@@ -991,14 +997,13 @@ def run_backtest_orderflow(
         if bar_open is None:
             bar_open = bar_high = bar_low = bar_close = tick.price
             bar_volume = tick.volume
-            bar_ts = tick.ts
+            bar_ts = _bucket_end_ts(bucket, bar_sec)
         else:
             assert bar_high is not None and bar_low is not None
             bar_high = max(bar_high, tick.price)
             bar_low = min(bar_low, tick.price)
             bar_close = tick.price
             bar_volume += tick.volume
-            bar_ts = tick.ts
 
         if in_position and side is not None:
             protective_reason = _protective_trigger_reason(side, snapshot, sl_price, tp_price)

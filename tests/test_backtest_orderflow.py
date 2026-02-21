@@ -62,6 +62,52 @@ def test_load_orderflow_ticks_from_csv(tmp_path: Path):
     assert tick.depth.get("bestAskSize") == 8.0
 
 
+def test_load_orderflow_ticks_uses_price_fallback_for_internal_csv(tmp_path: Path):
+    csv_path = tmp_path / "ticks_price_only.csv"
+    csv_path.write_text(
+        "timestamp,seq,price,trade_price,trade_size,bid,ask,bestBid,bestAsk,bestBidSize,bestAskSize,depth_bids,depth_asks\n"
+        "2026-02-18T12:17:28.653064Z,174199483,28102.5,,0.0,23934.0,,23934.0,,1.0,,\"[{\"\"price\"\":23934.0,\"\"size\"\":1.0}]\",[]\n",
+        encoding="utf-8",
+    )
+    ticks = load_orderflow_ticks_from_csv(str(csv_path))
+    assert len(ticks) == 1
+    tick = ticks[0]
+    assert tick.ts == "2026-02-18T12:17:28.653064Z"
+    assert tick.price == 28102.5
+    assert tick.seq == 174199483
+
+
+def test_load_orderflow_ticks_from_databento_mbp_csv(tmp_path: Path):
+    csv_path = tmp_path / "db_mbp.csv"
+    csv_path.write_text(
+        "ts_event,sequence,action,price,size,bid_px_00,bid_sz_00,ask_px_00,ask_sz_00,bid_px_01,bid_sz_01,ask_px_01,ask_sz_01\n"
+        "1767225600000000000,1001,A,21850250000000,7,21850000000000,40,21850500000000,35,21849750000000,30,21850750000000,20\n"
+        "1767225600100000000,1002,T,21850500000000,3,21850250000000,28,21850750000000,24,21850000000000,18,21851000000000,16\n",
+        encoding="utf-8",
+    )
+    ticks = load_orderflow_ticks_from_csv(str(csv_path))
+    assert len(ticks) == 2
+
+    first = ticks[0]
+    assert first.ts.endswith("Z")
+    assert first.seq == 1001
+    assert first.price == 21850.25  # mid of top-of-book
+    assert first.trade is None
+    assert first.quote == {"bid": 21850.0, "ask": 21850.5}
+    assert first.depth is not None
+    assert first.depth.get("bestBidSize") == 40.0
+    assert first.depth.get("bestAskSize") == 35.0
+    assert isinstance(first.depth.get("bids"), list) and len(first.depth.get("bids")) >= 2
+    assert isinstance(first.depth.get("asks"), list) and len(first.depth.get("asks")) >= 2
+
+    second = ticks[1]
+    assert second.seq == 1002
+    assert second.trade is not None
+    assert second.trade.get("price") == 21850.5
+    assert second.trade.get("size") == 3.0
+    assert second.volume == 3.0
+
+
 def test_run_backtest_orderflow_executes_tick_entry_and_exit():
     strategy = _TickEnterExitStrategy()
     ticks = [

@@ -20,7 +20,6 @@ from trading_algo.backtest import (
 from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, get_symbol_profile, load_runtime_config, must_env
 from trading_algo.core import BUY, SELL
 from trading_algo.ml import SetupMLGate, train_xgboost_from_csv
-from trading_algo.runtime.bot_runtime import run as run_forward_runtime
 from trading_algo.strategy import MarketBar, NYSessionMarketStructureStrategy, OneShotLongStrategy
 from trading_algo.telemetry import TelemetryRouter
 
@@ -152,6 +151,26 @@ _BACKTEST_MATRIX_COLUMNS = [
     "loss",
     "realized_rr",
     "result_label",
+]
+
+_BACKTEST_SUMMARY_COLUMNS = [
+    "run_id",
+    "strategy",
+    "source_csv",
+    "scenario_id",
+    "window_id",
+    "window_start_utc",
+    "window_end_utc",
+    "window_months",
+    "bars",
+    "num_trades",
+    "final_equity",
+    "net_pnl",
+    "return_pct",
+    "win_rate_pct",
+    "max_drawdown_pct",
+    "orderflow_replay",
+    "news_blackouts",
 ]
 
 
@@ -781,6 +800,26 @@ class _BacktestMatrixCsvWriter:
                 writer.writerow(row)
 
 
+class _BacktestSummaryCsvWriter:
+    def __init__(self, csv_path: str) -> None:
+        self._path = Path(csv_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_header()
+
+    @property
+    def path(self) -> str:
+        return str(self._path)
+
+    def _ensure_header(self) -> None:
+        _ensure_csv_header(self._path, _BACKTEST_SUMMARY_COLUMNS)
+
+    def append(self, payload: dict[str, Any]) -> None:
+        row = {col: payload.get(col) for col in _BACKTEST_SUMMARY_COLUMNS}
+        with self._path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_BACKTEST_SUMMARY_COLUMNS)
+            writer.writerow(row)
+
+
 class _BacktestMatrixTracker:
     def __init__(
         self,
@@ -1328,6 +1367,8 @@ def _build_backtest_scenarios(base_cfg: BacktestConfig) -> list[_RunScenario]:
 
 
 def run_forward(config: RuntimeConfig, strategy_name: str, hold_bars: int, profile: str) -> None:
+    from trading_algo.runtime.bot_runtime import run as run_forward_runtime
+
     enabled = env_bool("BOT_ENABLED", False)
     environment = (os.getenv("TRADING_ENVIRONMENT") or "DEMO").strip()
     strategy = _strategy_from_name(strategy_name, hold_bars, for_forward=True)
@@ -1355,6 +1396,9 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
     default_matrix_csv = os.path.join(telemetry.cfg.telemetry_dir, "backtest_candidate_matrix.csv")
     matrix_csv_path = (os.getenv("BACKTEST_MATRIX_CSV") or default_matrix_csv).strip() or default_matrix_csv
     matrix_writer = _BacktestMatrixCsvWriter(matrix_csv_path)
+    default_summary_csv = os.path.join(telemetry.cfg.telemetry_dir, "backtest_summary.csv")
+    summary_csv_path = (os.getenv("BACKTEST_SUMMARY_CSV") or default_summary_csv).strip() or default_summary_csv
+    summary_writer = _BacktestSummaryCsvWriter(summary_csv_path)
     shadow_gate = _build_backtest_shadow_gate()
 
     symbol = (os.getenv("SYMBOL") or "MNQ").strip().upper()
@@ -1555,6 +1599,27 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                 matrix_rows = matrix_tracker.finalize_rows()
                 matrix_writer.append_rows(matrix_rows)
                 total_matrix_rows += len(matrix_rows)
+                summary_writer.append(
+                    {
+                        "run_id": telemetry.cfg.run_id,
+                        "strategy": strategy_name,
+                        "source_csv": data_csv,
+                        "scenario_id": scenario.scenario_id,
+                        "window_id": window.window_id,
+                        "window_start_utc": window.start_utc.isoformat().replace("+00:00", "Z"),
+                        "window_end_utc": window.end_utc.isoformat().replace("+00:00", "Z"),
+                        "window_months": window.months,
+                        "bars": processed_rows,
+                        "num_trades": result.num_trades,
+                        "final_equity": round(result.final_equity, 6),
+                        "net_pnl": round(result.net_pnl, 6),
+                        "return_pct": round(result.total_return_pct, 6),
+                        "win_rate_pct": round(result.win_rate_pct, 6),
+                        "max_drawdown_pct": round(result.max_drawdown_pct, 6),
+                        "orderflow_replay": True,
+                        "news_blackouts": len(news_blackouts),
+                    }
+                )
                 print("BACKTEST RESULT")
                 print(
                     f"scenario={scenario.scenario_id} window_id={window.window_id} "
@@ -1701,6 +1766,27 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                 matrix_rows = matrix_tracker.finalize_rows()
                 matrix_writer.append_rows(matrix_rows)
                 total_matrix_rows += len(matrix_rows)
+                summary_writer.append(
+                    {
+                        "run_id": telemetry.cfg.run_id,
+                        "strategy": strategy_name,
+                        "source_csv": data_csv,
+                        "scenario_id": scenario.scenario_id,
+                        "window_id": window.window_id,
+                        "window_start_utc": window.start_utc.isoformat().replace("+00:00", "Z"),
+                        "window_end_utc": window.end_utc.isoformat().replace("+00:00", "Z"),
+                        "window_months": window.months,
+                        "bars": processed_rows,
+                        "num_trades": result.num_trades,
+                        "final_equity": round(result.final_equity, 6),
+                        "net_pnl": round(result.net_pnl, 6),
+                        "return_pct": round(result.total_return_pct, 6),
+                        "win_rate_pct": round(result.win_rate_pct, 6),
+                        "max_drawdown_pct": round(result.max_drawdown_pct, 6),
+                        "orderflow_replay": False,
+                        "news_blackouts": 0,
+                    }
+                )
                 print("BACKTEST RESULT")
                 print(
                     f"scenario={scenario.scenario_id} window_id={window.window_id} "
@@ -1720,6 +1806,7 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
     print(f"runs={run_count} bars={total_rows} trades={total_trades} net_pnl={total_net_pnl:.2f}")
     print(f"candidate_csv={candidates_csv_path}")
     print(f"matrix_csv={matrix_csv_path} rows={total_matrix_rows}")
+    print(f"summary_csv={summary_csv_path}")
 
 
 def run_train(data_csv: str, model_out: str) -> None:
