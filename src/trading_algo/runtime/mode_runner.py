@@ -379,6 +379,8 @@ def _in_session_utc(dt_utc: datetime, *, start: time, end: time, tz_name: str) -
         dt_local = dt_utc.astimezone(ZoneInfo(tz_name))
     except ZoneInfoNotFoundError:
         dt_local = dt_utc
+    if dt_local.weekday() >= 5:
+        return False
     t = dt_local.time()
     if start <= end:
         return start <= t < end

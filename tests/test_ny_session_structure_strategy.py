@@ -14,6 +14,8 @@ def test_ny_session_window_membership():
     assert strategy.is_in_session("2026-01-15T14:30:00Z") is True
     # 21:30 UTC = 16:30 America/New_York (outside by default window)
     assert strategy.is_in_session("2026-01-15T21:30:00Z") is False
+    # 15:00 UTC = 10:00 America/New_York on Saturday (weekend should be out-of-session)
+    assert strategy.is_in_session("2026-01-17T15:00:00Z") is False
 
 
 def test_outside_session_flat_no_entry():

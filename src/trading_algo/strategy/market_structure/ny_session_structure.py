@@ -139,6 +139,9 @@ class SessionWindow:
 
     def contains(self, ts: str) -> bool:
         dt_local = _to_local(_parse_ts(ts), self.tz_name)
+        # NY structure strategy should only trade on weekdays.
+        if dt_local.weekday() >= 5:
+            return False
         now_t = dt_local.time()
         if self.start <= self.end:
             return self.start <= now_t < self.end

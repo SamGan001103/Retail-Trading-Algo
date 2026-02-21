@@ -3,13 +3,13 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 from signalrcore.protocol.json_hub_protocol import JsonHubProtocol
 
 from trading_algo.api import ProjectXClient
-from trading_algo.config import env_bool
+from trading_algo.config import env_bool, env_float
 
 DEBUG_RTC = env_bool("DEBUG_RTC", False)
 
@@ -26,9 +26,10 @@ class RTState:
 class JsonHubProtocolRS(JsonHubProtocol):
     RS = "\x1e"
 
-    def __init__(self):
+    def __init__(self, on_parse_error: Callable[[Exception, int], None] | None = None):
         super().__init__()
         self._buffer = ""
+        self._on_parse_error = on_parse_error
 
     def parse_messages(self, raw: str):
         if not raw:
@@ -40,7 +41,11 @@ class JsonHubProtocolRS(JsonHubProtocol):
         for part in parts:
             part = part.strip()
             if part:
-                out.extend(super().parse_messages(part))
+                try:
+                    out.extend(super().parse_messages(part))
+                except Exception as exc:
+                    if self._on_parse_error is not None:
+                        self._on_parse_error(exc, len(part))
         if len(self._buffer) > 2_000_000:
             self._buffer = ""
         return out
@@ -73,6 +78,8 @@ class ProjectXRealtimeStream:
         self._mkt_conn = None
         self._user_connected = threading.Event()
         self._mkt_connected = threading.Event()
+        self._sub_lock = threading.RLock()
+        self._last_subscribe_ts = 0.0
 
     def _log(self, *args: Any) -> None:
         if DEBUG_RTC:
@@ -123,6 +130,17 @@ class ProjectXRealtimeStream:
         with self._lock:
             self._state.last_depth_by_contract[str(args[0])] = args[1]
 
+    def _on_user_close(self) -> None:
+        self._user_connected.clear()
+        self._log("User hub disconnected")
+
+    def _on_market_close(self) -> None:
+        self._mkt_connected.clear()
+        self._log("Market hub disconnected")
+
+    def _on_protocol_parse_error(self, hub_name: str, exc: Exception, payload_size: int) -> None:
+        self._log(f"{hub_name} hub parse error:", repr(exc), f"payload_size={payload_size}")
+
     def start(self, contract_id: str) -> None:
         if self._running:
             return
@@ -135,10 +153,16 @@ class ProjectXRealtimeStream:
         user_url = f"{self.user_hub_url}?access_token={token}"
         market_url = f"{self.market_hub_url}?access_token={token}"
 
+        user_protocol = JsonHubProtocolRS(
+            on_parse_error=lambda exc, size: self._on_protocol_parse_error("user", exc, size)
+        )
+        market_protocol = JsonHubProtocolRS(
+            on_parse_error=lambda exc, size: self._on_protocol_parse_error("market", exc, size)
+        )
         self._user_conn = (
             HubConnectionBuilder()
             .with_url(user_url)
-            .with_hub_protocol(JsonHubProtocolRS())
+            .with_hub_protocol(user_protocol)
             .with_automatic_reconnect(
                 {"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5, "max_attempts": 999999}
             )
@@ -147,7 +171,7 @@ class ProjectXRealtimeStream:
         self._mkt_conn = (
             HubConnectionBuilder()
             .with_url(market_url)
-            .with_hub_protocol(JsonHubProtocolRS())
+            .with_hub_protocol(market_protocol)
             .with_automatic_reconnect(
                 {"type": "raw", "keep_alive_interval": 10, "reconnect_interval": 5, "max_attempts": 999999}
             )
@@ -155,11 +179,23 @@ class ProjectXRealtimeStream:
         )
 
         self._user_conn.on_open(
-            lambda: (self._log("User hub connected"), self._user_connected.set(), self._send_subscriptions())
+            lambda: (
+                self._log("User hub connected"),
+                self._user_connected.set(),
+                self._send_subscriptions(force=True, reason="user_on_open"),
+            )
         )
         self._mkt_conn.on_open(
-            lambda: (self._log("Market hub connected"), self._mkt_connected.set(), self._send_subscriptions())
+            lambda: (
+                self._log("Market hub connected"),
+                self._mkt_connected.set(),
+                self._send_subscriptions(force=True, reason="market_on_open"),
+            )
         )
+        if hasattr(self._user_conn, "on_close"):
+            self._user_conn.on_close(lambda: self._on_user_close())
+        if hasattr(self._mkt_conn, "on_close"):
+            self._mkt_conn.on_close(lambda: self._on_market_close())
         self._user_conn.on_error(lambda data: self._log("User hub error:", data))
         self._mkt_conn.on_error(lambda data: self._log("Market hub error:", data))
         self._user_conn.on("GatewayUserOrder", self._on_user_order)
@@ -179,11 +215,17 @@ class ProjectXRealtimeStream:
             self.stop()
             raise RuntimeError("Realtime stream failed to connect (user/market hub) within 3 seconds.")
 
-    def _send_subscriptions(self) -> None:
+    def _send_subscriptions(self, *, force: bool = False, reason: str = "runtime") -> bool:
         if not self._user_conn or not self._mkt_conn or not self._contract_id:
-            return
+            return False
         if not self._user_connected.is_set() or not self._mkt_connected.is_set():
-            return
+            return False
+        cooldown_sec = max(1.0, env_float("RTC_RESUBSCRIBE_COOLDOWN_SEC", 10.0))
+        with self._sub_lock:
+            now_ts = time.time()
+            if (not force) and (now_ts - self._last_subscribe_ts) < cooldown_sec:
+                return False
+            self._last_subscribe_ts = now_ts
         try:
             self._user_conn.send("SubscribeAccounts", [])
             self._user_conn.send("SubscribeOrders", [self.account_id])
@@ -193,8 +235,21 @@ class ProjectXRealtimeStream:
             self._mkt_conn.send("SubscribeContractTrades", [self._contract_id])
             if env_bool("SUB_DEPTH", False):
                 self._mkt_conn.send("SubscribeContractMarketDepth", [self._contract_id])
+            self._log(
+                "Subscriptions sent",
+                f"reason={reason}",
+                f"contract_id={self._contract_id}",
+                f"sub_depth={env_bool('SUB_DEPTH', False)}",
+            )
+            return True
         except Exception as exc:
             self._log("Subscription error:", repr(exc))
+            with self._sub_lock:
+                self._last_subscribe_ts = 0.0
+            return False
+
+    def refresh_subscriptions(self) -> bool:
+        return self._send_subscriptions(reason="stale_data_refresh")
 
     def stop(self) -> None:
         if not self._running:

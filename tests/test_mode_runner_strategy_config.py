@@ -1,4 +1,6 @@
-from trading_algo.runtime.mode_runner import _strategy_from_name
+from datetime import datetime, time, timezone
+
+from trading_algo.runtime.mode_runner import _in_session_utc, _strategy_from_name
 from trading_algo.strategy import NYSessionMarketStructureStrategy
 
 
@@ -68,3 +70,8 @@ def test_forward_ml_policy_off_disables_gate_even_if_enabled(monkeypatch):
     assert isinstance(strategy, NYSessionMarketStructureStrategy)
     assert strategy.ml_decision_policy == "off"
     assert strategy._ml_gate is None
+
+
+def test_mode_runner_in_session_utc_excludes_weekends():
+    sat_dt = datetime(2026, 1, 17, 15, 0, tzinfo=timezone.utc)  # Saturday 10:00 ET
+    assert _in_session_utc(sat_dt, start=time(9, 30), end=time(16, 0), tz_name="America/New_York") is False

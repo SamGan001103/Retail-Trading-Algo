@@ -32,8 +32,9 @@ def _num(payload: dict[str, Any] | None, *keys: str) -> float | None:
     return None
 
 
-def _extract_event_dt(quote: dict[str, Any] | None, trade: dict[str, Any] | None) -> datetime:
-    payload = trade or quote or {}
+def _parse_payload_dt(payload: dict[str, Any] | None) -> datetime | None:
+    if payload is None:
+        return None
     for key in ("timestamp", "ts", "time", "datetime", "date"):
         raw = payload.get(key)
         if raw is None:
@@ -54,12 +55,44 @@ def _extract_event_dt(quote: dict[str, Any] | None, trade: dict[str, Any] | None
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc)
+    return None
+
+
+def _extract_event_dt(quote: dict[str, Any] | None, trade: dict[str, Any] | None) -> datetime:
+    quote_dt = _parse_payload_dt(quote)
+    trade_dt = _parse_payload_dt(trade)
+    if quote_dt is not None and trade_dt is not None:
+        return trade_dt if trade_dt >= quote_dt else quote_dt
+    if trade_dt is not None:
+        return trade_dt
+    if quote_dt is not None:
+        return quote_dt
     return datetime.now(timezone.utc)
 
 
 def _extract_price(quote: dict[str, Any] | None, trade: dict[str, Any] | None, last_price: float | None) -> float | None:
+    quote_dt = _parse_payload_dt(quote)
+    trade_dt = _parse_payload_dt(trade)
     trade_price = _num(trade, "price", "last", "lastPrice", "tradePrice", "close")
     if trade_price is not None:
+        bid = _num(quote, "bid", "bidPrice", "bestBid")
+        ask = _num(quote, "ask", "askPrice", "bestAsk")
+        quote_price = None
+        if bid is not None and ask is not None:
+            quote_price = (bid + ask) / 2.0
+        elif bid is not None:
+            quote_price = bid
+        elif ask is not None:
+            quote_price = ask
+
+        if quote_price is None:
+            return trade_price
+        if trade_dt is not None and quote_dt is not None:
+            return trade_price if trade_dt >= quote_dt else quote_price
+        if trade_dt is not None and quote_dt is None:
+            return trade_price
+        if quote_dt is not None and trade_dt is None:
+            return quote_price
         return trade_price
     bid = _num(quote, "bid", "bidPrice", "bestBid")
     ask = _num(quote, "ask", "askPrice", "bestAsk")
@@ -120,6 +153,17 @@ def _strategy_entry_mode(strategy: Strategy) -> str:
     return str(getattr(strategy, "entry_mode", "")).strip().lower()
 
 
+def _strategy_in_session(strategy: Strategy, now_utc: datetime) -> bool | None:
+    is_in_session = getattr(strategy, "is_in_session", None)
+    if not callable(is_in_session):
+        return None
+    ts = now_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    try:
+        return bool(is_in_session(ts))
+    except Exception:
+        return None
+
+
 def _depth_payload_available(depth: dict[str, Any] | None) -> bool:
     if not isinstance(depth, dict):
         return False
@@ -132,6 +176,25 @@ def _depth_payload_available(depth: dict[str, Any] | None) -> bool:
     if _num(depth, "bestBidSize", "bidSize", "bestAskSize", "askSize") is not None:
         return True
     return False
+
+
+def _market_data_key(
+    quote: dict[str, Any] | None,
+    trade: dict[str, Any] | None,
+    depth: dict[str, Any] | None,
+) -> tuple[Any, ...]:
+    return (
+        _parse_payload_dt(quote),
+        _parse_payload_dt(trade),
+        _num(quote, "bid", "bidPrice", "bestBid"),
+        _num(quote, "ask", "askPrice", "bestAsk"),
+        _num(trade, "price", "last", "lastPrice", "tradePrice", "close"),
+        _num(trade, "size", "qty", "quantity", "volume", "lastSize"),
+        _num(depth, "bestBid", "bidPrice"),
+        _num(depth, "bestAsk", "askPrice"),
+        _num(depth, "bestBidSize", "bidSize"),
+        _num(depth, "bestAskSize", "askSize"),
+    )
 
 
 def _strategy_side_name(side: int | None) -> str:
@@ -435,6 +498,14 @@ def _run_strategy_loop(
     exit_grace_until = 0.0
     tick_counter = 0
     active_candidate_id: str | None = None
+    last_market_key: tuple[Any, ...] | None = None
+    last_market_update_ts = time.time()
+    stale_data_warning_cooldown_sec = max(10.0, env_float("STRAT_STALE_DATA_WARNING_COOLDOWN_SEC", 60.0))
+    last_stale_data_warning_ts = 0.0
+    stream_restart_cooldown_sec = max(30.0, env_float("STRAT_STREAM_RESTART_COOLDOWN_SEC", 180.0))
+    last_stream_restart_ts = 0.0
+    out_of_session_log_cooldown_sec = max(30.0, env_float("STRAT_OUT_OF_SESSION_LOG_COOLDOWN_SEC", 300.0))
+    last_out_of_session_log_ts = 0.0
 
     if telemetry is not None:
         telemetry.emit_performance(
@@ -485,6 +556,92 @@ def _run_strategy_loop(
         quote = rt.last_quote(contract_id)
         trade = rt.last_trade(contract_id)
         depth = rt.last_depth(contract_id)
+        in_session = _strategy_in_session(strategy, datetime.now(timezone.utc))
+        if (in_session is False) and (not in_position):
+            if (now_ts - last_out_of_session_log_ts) >= out_of_session_log_cooldown_sec:
+                _runtime_log(
+                    profile,
+                    telemetry,
+                    "outside-session-idle",
+                    important=_is_debug(profile),
+                    contract_id=contract_id,
+                )
+                if telemetry is not None:
+                    telemetry.emit_performance(
+                        {
+                            "event_name": "outside_session_idle",
+                            "contract_id": contract_id,
+                        }
+                    )
+                last_out_of_session_log_ts = now_ts
+            time.sleep(tick_poll_idle_sec)
+            continue
+
+        market_key = _market_data_key(quote, trade, depth)
+        if market_key != last_market_key:
+            last_market_key = market_key
+            last_market_update_ts = now_ts
+        elif (now_ts - last_market_update_ts) >= stale_data_warning_cooldown_sec:
+            if (now_ts - last_stale_data_warning_ts) >= stale_data_warning_cooldown_sec:
+                event_dt = _extract_event_dt(quote, trade)
+                event_age_sec = max(0.0, (datetime.now(timezone.utc) - event_dt).total_seconds())
+                refresh_attempted = False
+                refresh_sent = False
+                restart_attempted = False
+                restart_sent = False
+                refresh_subscriptions = getattr(rt, "refresh_subscriptions", None)
+                if callable(refresh_subscriptions):
+                    refresh_attempted = True
+                    try:
+                        refresh_sent = bool(refresh_subscriptions())
+                    except Exception:
+                        refresh_sent = False
+                if (not refresh_sent) and (now_ts - last_stream_restart_ts) >= stream_restart_cooldown_sec:
+                    stop_stream = getattr(rt, "stop", None)
+                    start_stream = getattr(rt, "start", None)
+                    if callable(stop_stream) and callable(start_stream):
+                        restart_attempted = True
+                        try:
+                            stop_stream()
+                            start_stream(contract_id=contract_id)
+                            restart_sent = True
+                            last_stream_restart_ts = now_ts
+                            last_market_key = None
+                            last_market_update_ts = now_ts
+                        except Exception:
+                            restart_sent = False
+                _runtime_log(
+                    profile,
+                    telemetry,
+                    "market-data-stale-warning",
+                    important=True,
+                    stale_for_sec=round(now_ts - last_market_update_ts, 3),
+                    event_age_sec=round(event_age_sec, 3),
+                    last_event_ts=event_dt.isoformat().replace("+00:00", "Z"),
+                    refresh_attempted=refresh_attempted,
+                    refresh_sent=refresh_sent,
+                    restart_attempted=restart_attempted,
+                    restart_sent=restart_sent,
+                    contract_id=contract_id,
+                )
+                if telemetry is not None:
+                    telemetry.emit_performance(
+                        {
+                            "event_name": "market_data_stale_warning",
+                            "contract_id": contract_id,
+                            "stale_for_sec": round(now_ts - last_market_update_ts, 6),
+                            "event_age_sec": round(event_age_sec, 6),
+                            "last_event_ts": event_dt.isoformat().replace("+00:00", "Z"),
+                            "refresh_attempted": bool(refresh_attempted),
+                            "refresh_sent": bool(refresh_sent),
+                            "restart_attempted": bool(restart_attempted),
+                            "restart_sent": bool(restart_sent),
+                        }
+                    )
+                last_stale_data_warning_ts = now_ts
+            time.sleep(tick_poll_idle_sec)
+            continue
+
         flow = OrderFlowState(quote=quote, trade=trade, depth=depth)
         if hasattr(strategy, "set_orderflow_state"):
             getattr(strategy, "set_orderflow_state")(flow)
