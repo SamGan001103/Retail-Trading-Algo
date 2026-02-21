@@ -115,6 +115,31 @@ def _within_day_bounds(day_tag: str | None, start_day: str | None, end_day: str 
     return True
 
 
+def _is_weekday_day_tag(day_tag: str | None) -> bool:
+    if day_tag is None:
+        return True
+    try:
+        day = datetime.strptime(day_tag, "%Y%m%d")
+    except ValueError:
+        return True
+    # Monday=0 ... Sunday=6
+    return day.weekday() < 5
+
+
+def _passes_day_filters(
+    day_tag: str | None,
+    *,
+    start_day: str | None,
+    end_day: str | None,
+    weekdays_only: bool,
+) -> bool:
+    if not _within_day_bounds(day_tag, start_day, end_day):
+        return False
+    if weekdays_only and (not _is_weekday_day_tag(day_tag)):
+        return False
+    return True
+
+
 def _to_utc_day(raw: str | None) -> str | None:
     text = str(raw or "").strip()
     if text == "":
@@ -182,6 +207,7 @@ def _split_csv_by_day(
     source_label: str,
     start_day: str | None,
     end_day: str | None,
+    weekdays_only: bool,
 ) -> list[tuple[str, Path]]:
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
@@ -202,7 +228,7 @@ def _split_csv_by_day(
                 day = _to_utc_day(_pick_timestamp_value(row))
                 if day is None:
                     continue
-                if not _within_day_bounds(day, start_day, end_day):
+                if not _passes_day_filters(day, start_day=start_day, end_day=end_day, weekdays_only=weekdays_only):
                     continue
                 if day not in writers:
                     out_path = split_dir / f"{_safe_label(source_label)}_{day}.csv"
@@ -247,6 +273,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-csv", action="store_true", help="Keep per-day temporary CSV files.")
     parser.add_argument("--start-day", default="", help="Optional lower day bound YYYYMMDD.")
     parser.add_argument("--end-day", default="", help="Optional upper day bound YYYYMMDD.")
+    parser.add_argument(
+        "--weekdays-only",
+        action="store_true",
+        default=True,
+        help="Skip Saturday/Sunday day partitions (default enabled).",
+    )
+    parser.add_argument(
+        "--all-days",
+        action="store_false",
+        dest="weekdays_only",
+        help="Include weekend day partitions.",
+    )
     parser.add_argument("--max-days", type=int, default=0, help="Optional cap on processed days; 0 means unlimited.")
     parser.add_argument("--continue-on-error", action="store_true", help="Continue with next day if one day fails.")
     parser.add_argument("--list-only", action="store_true", help="List selected sources and exit.")
@@ -269,12 +307,22 @@ def main() -> int:
     exclude = [x.strip() for x in list(args.exclude or []) if x.strip() != ""]
     start_day = args.start_day.strip() or None
     end_day = args.end_day.strip() or None
+    weekdays_only = bool(args.weekdays_only)
     max_days = max(0, int(args.max_days))
     tmp_dir = Path(args.tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     discovered = _discover_sources(input_path, include, exclude)
-    selected = [s for s in discovered if _within_day_bounds(s.day_tag, start_day, end_day)]
+    selected = [
+        s
+        for s in discovered
+        if _passes_day_filters(
+            s.day_tag,
+            start_day=start_day,
+            end_day=end_day,
+            weekdays_only=weekdays_only,
+        )
+    ]
     if not selected:
         raise RuntimeError("No Databento sources selected for backtest.")
 
@@ -350,7 +398,7 @@ def main() -> int:
             csv_days: list[tuple[str, Path]] = []
             known_day = source.day_tag
             if known_day is not None:
-                if _within_day_bounds(known_day, start_day, end_day):
+                if _passes_day_filters(known_day, start_day=start_day, end_day=end_day, weekdays_only=weekdays_only):
                     csv_days = [(known_day, local_csv)]
             else:
                 csv_days = _split_csv_by_day(
@@ -359,6 +407,7 @@ def main() -> int:
                     source_label=source_label,
                     start_day=start_day,
                     end_day=end_day,
+                    weekdays_only=weekdays_only,
                 )
 
             if not csv_days:
