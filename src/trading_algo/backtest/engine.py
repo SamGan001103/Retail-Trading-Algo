@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -690,7 +691,7 @@ def run_backtest(
 
 
 def run_backtest_orderflow(
-    ticks: list[OrderFlowTick],
+    ticks: Iterable[OrderFlowTick],
     strategy: Strategy,
     config: BacktestConfig,
     *,
@@ -699,25 +700,44 @@ def run_backtest_orderflow(
     execution_callback: Callable[[dict[str, Any]], None] | None = None,
     candidate_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> BacktestResult:
-    if not ticks:
-        raise RuntimeError("Orderflow backtest requires at least one tick")
-    bar_sec = max(1, int(bar_sec))
+    replay_iter: Iterator[OrderFlowTick]
+    first_tick: OrderFlowTick
+    if isinstance(ticks, list):
+        if not ticks:
+            raise RuntimeError("Orderflow backtest requires at least one tick")
 
-    # Deterministic replay: monotonic (ts, seq) fast-path, otherwise sort once.
-    ordered = True
-    prev_key: tuple[datetime, int] | None = None
-    for i, tick in enumerate(ticks):
-        key = (_parse_ts(tick.ts), int(tick.seq) if int(tick.seq) > 0 else i + 1)
-        if prev_key is not None and key < prev_key:
-            ordered = False
-            break
-        prev_key = key
-    replay_ticks = ticks
-    if not ordered:
-        replay_ticks = sorted(
-            ticks,
-            key=lambda t: (_parse_ts(t.ts), int(t.seq) if int(t.seq) > 0 else 0),
-        )
+        # Deterministic replay: monotonic (ts, seq) fast-path, otherwise sort once.
+        ordered = True
+        prev_key: tuple[datetime, int] | None = None
+        for i, tick in enumerate(ticks):
+            key = (_parse_ts(tick.ts), int(tick.seq) if int(tick.seq) > 0 else i + 1)
+            if prev_key is not None and key < prev_key:
+                ordered = False
+                break
+            prev_key = key
+        replay_ticks = ticks
+        if not ordered:
+            replay_ticks = sorted(
+                ticks,
+                key=lambda t: (_parse_ts(t.ts), int(t.seq) if int(t.seq) > 0 else 0),
+            )
+        first_tick = replay_ticks[0]
+        replay_iter = iter(replay_ticks)
+    else:
+        iterator = iter(ticks)
+        try:
+            first_tick = next(iterator)
+        except StopIteration as exc:
+            raise RuntimeError("Orderflow backtest requires at least one tick") from exc
+
+        def _prepend(first: OrderFlowTick, rest: Iterator[OrderFlowTick]) -> Iterator[OrderFlowTick]:
+            yield first
+            for item in rest:
+                yield item
+
+        replay_iter = _prepend(first_tick, iterator)
+
+    bar_sec = max(1, int(bar_sec))
 
     cash = float(config.initial_cash)
     equity = cash
@@ -749,8 +769,10 @@ def run_backtest_orderflow(
     bar_volume = 0.0
     bar_ts = ""
     bar_index = 0
-    snapshot = MarketSnapshot(ts=replay_ticks[0].ts, last_px=float(replay_ticks[0].price), last_sz=float(replay_ticks[0].volume))
-    last_tick_price = replay_ticks[0].price
+    snapshot = MarketSnapshot(ts=first_tick.ts, last_px=float(first_tick.price), last_sz=float(first_tick.volume))
+    last_tick_price = first_tick.price
+    last_tick_ts = first_tick.ts
+    last_tick_idx = 0
 
     def _close_position(
         *,
@@ -976,10 +998,12 @@ def run_backtest_orderflow(
                 }
             )
 
-    for idx, tick in enumerate(replay_ticks):
+    for idx, tick in enumerate(replay_iter):
         _safe_set_orderflow_state(strategy, tick)
         _update_snapshot(snapshot, tick)
         last_tick_price = tick.price
+        last_tick_ts = tick.ts
+        last_tick_idx = idx
         tick_dt = _parse_ts(tick.ts)
         bucket = int(tick_dt.timestamp()) // bar_sec
 
@@ -1122,7 +1146,7 @@ def run_backtest_orderflow(
                     )
 
     if current_bucket is not None and bar_open is not None and bar_high is not None and bar_low is not None and bar_close is not None:
-        _process_completed_bar(len(replay_ticks) - 1)
+        _process_completed_bar(last_tick_idx)
 
     if in_position and side is not None:
         end_side = SELL if side == BUY else BUY
@@ -1138,10 +1162,10 @@ def run_backtest_orderflow(
         if end_fill is not None:
             _close_position(
                 realized_exit=float(end_fill),
-                exit_ts=replay_ticks[-1].ts,
+                exit_ts=last_tick_ts,
                 reason="end_of_data",
                 event_name="force_close_end_of_data",
-                idx=len(replay_ticks) - 1,
+                idx=last_tick_idx,
             )
 
     if telemetry_callback is not None and missing_quote_trigger_count > 0:

@@ -1,1 +1,0 @@
-run_id,strategy,window_months,event_name,bar_index,bar_ts,candidate_id,status,reason,side,setup_index,setup_ts,setup_close,has_recent_sweep,htf_bias,bias_ok,continuation,reversal,equal_levels,fib_retracement,key_area_proximity,confluence_score

@@ -9,8 +9,10 @@ description = "Retail trading algorithm runtime and execution stack"
 requires-python = ">=3.11"
 dependencies = [
   "python-dotenv",
+  "pyarrow",
   "requests",
   "signalrcore",
+  "tzdata",
 ]
 
 [tool.setuptools]

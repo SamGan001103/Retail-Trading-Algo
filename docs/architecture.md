@@ -1,57 +1,54 @@
 # Architecture
 
-## Layers
+## Layer Overview
 
-- `config`: environment/config loading, validation, and symbol default profiles
-- `core`: shared constants and side definitions
-- `api`: authenticated ProjectX HTTP client and contract helpers
-- `broker`: adapter boundary between runtime and provider-specific implementations
-- `execution`: order placement, bracket signing, flatten/snapshot operations
-- `strategy`: strategy protocol plus concrete strategies
-- `position_management`: stop-loss/take-profit planners and position/order guards
-- `runtime`: mode orchestration, realtime loop, drawdown guard, stream compatibility alias
-- `backtest`: CSV loading and simulation engine (fees/slippage/bracket handling)
-- `ml`: setup gate and training scaffold
-- `telemetry`: logger helper hooks
+1. `config`: env parsing, typed settings, symbol defaults
+2. `api`: authenticated broker HTTP client and contract helpers
+3. `broker`: provider adapter boundary (`projectx` implementation)
+4. `runtime`: mode orchestration and forward realtime loop
+5. `strategy`: strategy protocol + concrete strategies
+6. `backtest`: historical data loaders + simulation engine
+7. `position_management`: stop-loss/take-profit planners + limits
+8. `ml`: training and runtime gate scaffolding
+9. `telemetry`: structured telemetry sinks
 
-## Runtime Flow (`forward`)
+## Active Runtime Paths
 
-1. Load runtime config from `.env`.
-2. Resolve runtime profile (`normal` or `debug`) from CLI/env.
-3. Initialize telemetry sinks (`candidate_trades.jsonl`, `performance.jsonl`).
-4. Build broker adapter (`BROKER`, currently `projectx`).
-5. Resolve contract id from symbol/live route.
-6. Start realtime user/market streams.
-7. Build bars from stream ticks.
-8. Evaluate strategy decisions (bar and optional tick path).
-9. Place market orders with bracket ticks from strategy decision or defaults.
-10. Enforce runtime safeguards:
-   - `position_management.guards` limits (positions/orders)
-   - `runtime.drawdown_guard` kill-switch (halt + flatten on breach)
-11. Continue until stopped.
+### Forward (`--mode forward`)
 
-Profile behavior:
+1. CLI (`scripts/execution/start_trading.py`) parses mode/strategy/profile.
+2. `src/trading_algo/runtime/mode_runner.py` resolves config and strategy.
+3. `src/trading_algo/runtime/bot_runtime.py` starts stream and executes strategy loop.
+4. Strategy decisions place/cancel/flatten through broker adapter.
+5. Telemetry appends to JSONL outputs.
 
-- `normal`: reduced console output, telemetry append still enabled.
-- `debug`: verbose strategy-process traces + telemetry append.
+### Backtest (`--mode backtest`)
 
-## Backtest Flow (`backtest`)
+1. `mode_runner` requires parquet orderflow input.
+2. `backtest/data.py` streams parquet batches as `OrderFlowTick` events.
+3. `backtest/engine.py` runs the event-driven simulator with rolling orderflow state.
+4. Backtest telemetry writes parquet datasets (candidates, matrix, summary).
 
-1. Load OHLCV CSV into `MarketBar`.
-2. Instantiate strategy through mode runner.
-3. Simulate strategy decisions bar-by-bar.
-4. Simulate bracket SL/TP hits from bar high/low.
-5. Track equity, drawdown, trades, win rate, and returns.
-6. Optionally halt new entries on absolute drawdown threshold.
+### Train (`--mode train`)
 
-## Train Flow (`train`)
+1. Load parquet dataset.
+2. Build feature/label arrays.
+3. Train model and persist artifact.
 
-1. Load labeled dataset from CSV.
-2. Build simple feature/label arrays.
-3. Train XGBoost model.
-4. Persist model artifact for runtime ML gate.
+## Data Ingestion Paths
 
-## Entrypoints
+1. DBN -> parquet conversion: `scripts/data/convert_databento_dbn_to_parquet.py`
+2. Parquet schema/sample inspection: `scripts/data/inspect_parquet_columns.py`
 
-- `scripts/execution/start_trading.py`: master launcher (`--mode forward|backtest|train`)
-- `scripts/debug/`: operational broker-routed debug scripts
+## Key Entrypoints
+
+1. `scripts/execution/start_trading.py`
+2. `src/trading_algo/runtime/mode_runner.py`
+3. `src/trading_algo/runtime/bot_runtime.py`
+4. `src/trading_algo/backtest/data.py`
+5. `src/trading_algo/backtest/engine.py`
+
+## Cleanup Notes
+
+1. Forward runtime is strategy-only; legacy non-strategy execution loop was removed.
+2. Backtest is parquet-only and streams batches to keep memory stable on large datasets.

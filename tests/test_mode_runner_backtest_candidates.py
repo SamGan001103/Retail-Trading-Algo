@@ -1,12 +1,15 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from trading_algo.backtest import OrderFlowTick
+import pytest
+
+from trading_algo.backtest import BacktestConfig, OrderFlowParquetScan, OrderFlowTick
 from trading_algo.runtime.mode_runner import (
     _BacktestMatrixTracker,
-    _BacktestMatrixCsvWriter,
-    _BacktestSummaryCsvWriter,
-    _BacktestCandidateCsvWriter,
+    _BacktestMatrixParquetWriter,
+    _BacktestSummaryParquetWriter,
+    _BacktestCandidateParquetWriter,
+    _assess_backtest_health,
     _apply_shadow_ml,
     _build_backtest_scenarios,
     _build_backtest_shadow_gate,
@@ -15,9 +18,8 @@ from trading_algo.runtime.mode_runner import (
     _load_major_news_blackouts,
     _latest_months_window,
     _latest_months_window_ticks,
-    _validate_orderflow_backtest_preflight,
+    _validate_orderflow_backtest_preflight_parquet,
 )
-from trading_algo.backtest import BacktestConfig
 from trading_algo.strategy import MarketBar
 
 
@@ -42,10 +44,24 @@ def test_latest_months_window_keeps_most_recent_six_months():
     ]
 
 
-def test_backtest_candidate_csv_writer_appends_rows(tmp_path: Path):
-    csv_path = tmp_path / "backtest_candidates.csv"
-    writer = _BacktestCandidateCsvWriter(
-        str(csv_path),
+def _read_parquet_rows(dataset_dir: Path) -> list[dict]:
+    ds = pytest.importorskip("pyarrow.dataset")
+
+    table = ds.dataset(str(dataset_dir), format="parquet").to_table()
+    columns = table.to_pydict()
+    names = list(columns.keys())
+    rows = len(columns[names[0]]) if names else 0
+    out: list[dict] = []
+    for i in range(rows):
+        out.append({name: columns[name][i] for name in names})
+    return out
+
+
+def test_backtest_candidate_parquet_writer_appends_rows(tmp_path: Path):
+    pytest.importorskip("pyarrow")
+    parquet_path = tmp_path / "backtest_candidates.parquet"
+    writer = _BacktestCandidateParquetWriter(
+        str(parquet_path),
         run_id="run-1",
         strategy="ny_structure",
         scenario_id="base",
@@ -82,58 +98,18 @@ def test_backtest_candidate_csv_writer_appends_rows(tmp_path: Path):
             "confluence_score": 3,
         }
     )
+    writer.close()
 
-    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 3
-    assert lines[0].startswith("run_id,strategy,scenario_id,window_id,window_start_utc,window_end_utc,window_months")
-    assert "cand-1" in lines[1]
-    assert "cand-2" in lines[2]
-
-
-def test_backtest_candidate_csv_writer_rotates_legacy_header(tmp_path: Path):
-    csv_path = tmp_path / "backtest_candidates.csv"
-    csv_path.write_text(
-        "run_id,strategy,window_months,event_name\nold-run,ny_structure,6,strategy_candidate\n",
-        encoding="utf-8",
-    )
-    writer = _BacktestCandidateCsvWriter(
-        str(csv_path),
-        run_id="run-2",
-        strategy="ny_structure",
-        scenario_id="base",
-        window_id="latest_6m",
-        window_months=6,
-        window_start_utc=datetime(2025, 7, 1, tzinfo=timezone.utc),
-        window_end_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
-    )
-    writer.append(
-        {
-            "event_name": "strategy_candidate",
-            "bar_index": 1,
-            "bar_ts": "2026-01-01T00:01:00Z",
-            "candidate_id": "cand-new",
-            "status": "detected",
-            "reason": "setup-ready",
-            "side": "buy",
-            "setup_index": 1,
-            "setup_ts": "2026-01-01T00:01:00Z",
-            "confluence_score": 2,
-        }
-    )
-    rotated = list(tmp_path.glob("backtest_candidates.legacy_*.csv"))
-    assert len(rotated) == 1
-    out_lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert out_lines[0].startswith("run_id,strategy,scenario_id,window_id,window_start_utc,window_end_utc,window_months")
-    assert "cand-new" in out_lines[1]
+    rows = _read_parquet_rows(tmp_path / "backtest_candidates")
+    assert len(rows) == 2
+    candidate_ids = {str(row.get("candidate_id")) for row in rows}
+    assert candidate_ids == {"cand-1", "cand-2"}
 
 
-def test_backtest_matrix_csv_writer_rotates_legacy_header(tmp_path: Path):
-    csv_path = tmp_path / "backtest_candidate_matrix.csv"
-    csv_path.write_text(
-        "run_id,strategy,window_months,candidate_id\nold-run,ny_structure,6,cand-legacy\n",
-        encoding="utf-8",
-    )
-    writer = _BacktestMatrixCsvWriter(str(csv_path))
+def test_backtest_matrix_parquet_writer_appends_rows(tmp_path: Path):
+    pytest.importorskip("pyarrow")
+    parquet_path = tmp_path / "backtest_candidate_matrix.parquet"
+    writer = _BacktestMatrixParquetWriter(str(parquet_path))
     writer.append_rows(
         [
             {
@@ -146,21 +122,22 @@ def test_backtest_matrix_csv_writer_rotates_legacy_header(tmp_path: Path):
             }
         ]
     )
-    rotated = list(tmp_path.glob("backtest_candidate_matrix.legacy_*.csv"))
-    assert len(rotated) == 1
-    out_lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert out_lines[0].startswith("run_id,strategy,scenario_id,window_id,window_start_utc,window_end_utc,window_months")
-    assert "cand-new" in out_lines[1]
+    writer.close()
+
+    rows = _read_parquet_rows(tmp_path / "backtest_candidate_matrix")
+    assert len(rows) == 1
+    assert rows[0]["candidate_id"] == "cand-new"
 
 
-def test_backtest_summary_csv_writer_appends_rows(tmp_path: Path):
-    csv_path = tmp_path / "backtest_summary.csv"
-    writer = _BacktestSummaryCsvWriter(str(csv_path))
+def test_backtest_summary_parquet_writer_appends_rows(tmp_path: Path):
+    pytest.importorskip("pyarrow")
+    parquet_path = tmp_path / "backtest_summary.parquet"
+    writer = _BacktestSummaryParquetWriter(str(parquet_path))
     writer.append(
         {
             "run_id": "run-1",
             "strategy": "ny_structure",
-            "source_csv": "data/day1.csv",
+            "source_path": "data/parquet/day1",
             "scenario_id": "base",
             "window_id": "latest_6m",
             "window_start_utc": "2026-01-01T00:00:00Z",
@@ -177,11 +154,12 @@ def test_backtest_summary_csv_writer_appends_rows(tmp_path: Path):
             "news_blackouts": 2,
         }
     )
-    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 2
-    assert lines[0].startswith("run_id,strategy,source_csv,scenario_id,window_id")
-    assert "data/day1.csv" in lines[1]
-    assert ",22," in lines[1]
+    writer.close()
+
+    rows = _read_parquet_rows(tmp_path / "backtest_summary")
+    assert len(rows) == 1
+    assert rows[0]["source_path"] == "data/parquet/day1"
+    assert rows[0]["num_trades"] == 22
 
 
 def test_latest_months_window_ticks_keeps_recent_window():
@@ -230,21 +208,30 @@ def test_ensure_orderflow_backtest_dataset_requires_depth():
         )
     ]
     try:
-        _ensure_orderflow_backtest_dataset(ticks, "x.csv")
+        _ensure_orderflow_backtest_dataset(ticks, "x.parquet")
         assert False, "expected RuntimeError for missing depth fields"
     except RuntimeError as exc:
         assert "No usable depth data" in str(exc)
 
 
 def test_load_major_news_blackouts_filters_major_and_merges(tmp_path: Path):
-    news_path = tmp_path / "news.csv"
-    news_path.write_text(
-        "timestamp,impact,currency,event\n"
-        "2026-01-01T14:30:00Z,high,USD,ISM\n"
-        "2026-01-01T14:40:00Z,low,USD,minor\n"
-        "2026-01-01T14:45:00Z,3,USD,NFP\n",
-        encoding="utf-8",
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    news_path = tmp_path / "news.parquet"
+    table = pa.table(
+        {
+            "timestamp": [
+                "2026-01-01T14:30:00Z",
+                "2026-01-01T14:40:00Z",
+                "2026-01-01T14:45:00Z",
+            ],
+            "impact": ["high", "low", "3"],
+            "currency": ["USD", "USD", "USD"],
+            "event": ["ISM", "minor", "NFP"],
+        }
     )
+    pq.write_table(table, str(news_path))
     intervals = _load_major_news_blackouts(
         str(news_path),
         pre_minutes=10,
@@ -389,43 +376,28 @@ def test_build_backtest_scenarios_includes_sweeps(monkeypatch):
     assert "spread_k2" in ids
 
 
-def test_validate_orderflow_preflight_report(tmp_path: Path, monkeypatch):
-    csv_path = tmp_path / "ticks.csv"
-    csv_path.write_text(
-        "timestamp,seq,bid,ask,price,size,bestBidSize,bestAskSize\n"
-        "2026-01-01T14:30:00Z,1,100.0,100.25,100.1,1,10,12\n"
-        "2026-01-01T14:30:01Z,2,100.0,100.25,100.15,1,8,9\n",
-        encoding="utf-8",
+def test_validate_orderflow_preflight_report(monkeypatch):
+    scan = OrderFlowParquetScan(
+        path="data/parquet/ticks",
+        source_files=["data/parquet/ticks/part-00001.parquet"],
+        columns=["ts_event", "sequence", "bid_px_00", "ask_px_00", "bid_sz_00", "ask_sz_00"],
+        rows=2,
+        parseable_timestamps=2,
+        explicit_tz_timestamps=2,
+        quote_rows=2,
+        depth_rows=2,
+        first_ts_utc=datetime(2026, 1, 1, 14, 30, tzinfo=timezone.utc),
+        last_ts_utc=datetime(2026, 1, 1, 14, 30, 1, tzinfo=timezone.utc),
     )
-    ticks = [
-        OrderFlowTick(
-            ts="2026-01-01T14:30:00Z",
-            price=100.1,
-            volume=1.0,
-            quote={"bid": 100.0, "ask": 100.25},
-            trade={"price": 100.1, "size": 1.0},
-            depth={"bestBid": 100.0, "bestAsk": 100.25, "bestBidSize": 10.0, "bestAskSize": 12.0},
-            seq=1,
-        ),
-        OrderFlowTick(
-            ts="2026-01-01T14:30:01Z",
-            price=100.15,
-            volume=1.0,
-            quote={"bid": 100.0, "ask": 100.25},
-            trade={"price": 100.15, "size": 1.0},
-            depth={"bestBid": 100.0, "bestAsk": 100.25, "bestBidSize": 8.0, "bestAskSize": 9.0},
-            seq=2,
-        ),
-    ]
     monkeypatch.setenv("BACKTEST_PREFLIGHT_STRICT", "true")
     monkeypatch.setenv("BACKTEST_PREFLIGHT_MIN_ROWS", "1")
     monkeypatch.setenv("BACKTEST_PREFLIGHT_MIN_SESSION_ROWS", "1")
     monkeypatch.setenv("BACKTEST_PREFLIGHT_MIN_QUOTE_COVERAGE", "0.5")
     monkeypatch.setenv("BACKTEST_PREFLIGHT_MIN_DEPTH_COVERAGE", "0.5")
     monkeypatch.setenv("STRAT_AVOID_NEWS", "false")
-    report = _validate_orderflow_backtest_preflight(
-        data_csv=str(csv_path),
-        ticks=ticks,
+    report = _validate_orderflow_backtest_preflight_parquet(
+        data_path=scan.path,
+        scan=scan,
         window_start=datetime(2026, 1, 1, 14, 0, tzinfo=timezone.utc),
         window_end=datetime(2026, 1, 1, 15, 0, tzinfo=timezone.utc),
         news_blackouts=[],
@@ -433,3 +405,42 @@ def test_validate_orderflow_preflight_report(tmp_path: Path, monkeypatch):
     assert report["rows"] == 2
     assert report["quote_coverage"] >= 0.5
     assert report["depth_coverage"] >= 0.5
+
+
+def test_assess_backtest_health_warns_when_ny_has_no_candidates_and_trades(monkeypatch):
+    monkeypatch.delenv("BACKTEST_HEALTH_MIN_CANDIDATES", raising=False)
+    monkeypatch.delenv("BACKTEST_HEALTH_MIN_TRADES", raising=False)
+    monkeypatch.delenv("BACKTEST_HEALTH_MAX_DRAWDOWN_PCT", raising=False)
+
+    status, reasons = _assess_backtest_health(
+        strategy_name="ny_structure",
+        rows=1000,
+        candidates=0,
+        entered_candidates=0,
+        matrix_rows=0,
+        trades=0,
+        drawdown_pct=0.5,
+    )
+
+    assert status == "warning"
+    assert any("low-candidates" in reason for reason in reasons)
+    assert any("low-trades" in reason for reason in reasons)
+
+
+def test_assess_backtest_health_warns_on_drawdown_breach(monkeypatch):
+    monkeypatch.setenv("BACKTEST_HEALTH_MIN_CANDIDATES", "0")
+    monkeypatch.setenv("BACKTEST_HEALTH_MIN_TRADES", "0")
+    monkeypatch.setenv("BACKTEST_HEALTH_MAX_DRAWDOWN_PCT", "1.5")
+
+    status, reasons = _assess_backtest_health(
+        strategy_name="oneshot",
+        rows=500,
+        candidates=2,
+        entered_candidates=1,
+        matrix_rows=2,
+        trades=1,
+        drawdown_pct=2.0,
+    )
+
+    assert status == "warning"
+    assert any("drawdown-breach" in reason for reason in reasons)

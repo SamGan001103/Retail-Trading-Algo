@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from trading_algo.broker import broker_from_runtime_config
-from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, get_symbol_profile, load_runtime_config
+from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, get_symbol_profile
 from trading_algo.core import BUY
 from trading_algo.position_management import RiskLimits, enforce_position_limits
 from trading_algo.runtime.drawdown_guard import DrawdownGuard
@@ -264,176 +264,6 @@ def _drain_candidate_events(
             payload.update(event)
             telemetry.emit_candidate(payload)
     return entered_candidate_id
-
-
-def _run_legacy_loop(
-    config: RuntimeConfig,
-    broker,
-    contract_id: str,
-    rt,
-    *,
-    profile: str,
-    telemetry: TelemetryRouter | None,
-) -> None:
-    traded_once = False
-    was_in_position = False
-    exit_grace_until = 0.0
-    last_price: float | None = None
-
-    limits = RiskLimits(
-        max_open_positions=max(1, env_int("STRAT_MAX_OPEN_POSITIONS", 1)),
-        max_open_orders_while_flat=max(0, env_int("STRAT_MAX_OPEN_ORDERS_WHILE_FLAT", 0)),
-    )
-    tick_size, tick_value = _tick_size_and_value_from_env(config.symbol)
-    drawdown_guard = DrawdownGuard(
-        max_drawdown_abs=_drawdown_killswitch_from_env(),
-        tick_size=tick_size,
-        tick_value=tick_value,
-        enabled=env_bool("STRAT_DRAWDOWN_GUARD_ENABLED", True),
-    )
-    drawdown_tripped = False
-
-    while True:
-        orders_all, positions_all = rt.snapshot()
-        orders = _filter_by_contract(orders_all, contract_id)
-        positions = _filter_by_contract(positions_all, contract_id)
-
-        in_position = len(positions) > 0
-        now = time.time()
-        if was_in_position and not in_position:
-            exit_grace_until = now + float(config.exit_grace_sec)
-        was_in_position = in_position
-        in_exit_grace = now < exit_grace_until
-
-        limits_ok, limits_reason = enforce_position_limits(len(positions), len(orders), limits)
-        if not limits_ok:
-            _runtime_log(
-                profile,
-                telemetry,
-                "position-limits-breach",
-                reason=limits_reason,
-                contract_id=contract_id,
-            )
-            cancel_attempted, close_attempted = broker.flatten(config.account_id)
-            if telemetry is not None:
-                telemetry.emit_execution(
-                    {
-                        "event_name": "flatten",
-                        "source": "legacy_position_limits",
-                        "contract_id": contract_id,
-                        "cancel_attempted": bool(cancel_attempted),
-                        "close_attempted": bool(close_attempted),
-                    }
-                )
-            time.sleep(config.loop_sec)
-            continue
-
-        quote = rt.last_quote(contract_id)
-        trade = rt.last_trade(contract_id)
-        price = _extract_price(quote, trade, last_price)
-        if price is not None:
-            last_price = price
-            if positions:
-                p0 = positions[0]
-                pos_state = PositionState(
-                    in_position=True,
-                    side=_position_side(p0),
-                    size=_position_size(p0),
-                    entry_price=_position_entry_price(p0),
-                    bars_in_position=0,
-                )
-            else:
-                pos_state = PositionState(in_position=False)
-            dd = drawdown_guard.update(pos_state, price)
-            if dd.breached and not drawdown_tripped:
-                drawdown_tripped = True
-                _runtime_log(
-                    profile,
-                    telemetry,
-                    "drawdown-guard-tripped",
-                    drawdown_abs=round(dd.drawdown_abs, 6),
-                    max_drawdown_abs=round(drawdown_guard.max_drawdown_abs, 6),
-                )
-                if telemetry is not None:
-                    telemetry.emit_performance(
-                        {
-                            "event_name": "drawdown_guard_tripped",
-                            "drawdown_abs": round(dd.drawdown_abs, 6),
-                            "max_drawdown_abs": round(drawdown_guard.max_drawdown_abs, 6),
-                        }
-                    )
-        if drawdown_tripped:
-            if in_position and not in_exit_grace:
-                cancel_attempted, close_attempted = broker.flatten(config.account_id)
-                if telemetry is not None:
-                    telemetry.emit_execution(
-                        {
-                            "event_name": "flatten",
-                            "source": "legacy_drawdown_guard",
-                            "contract_id": contract_id,
-                            "cancel_attempted": bool(cancel_attempted),
-                            "close_attempted": bool(close_attempted),
-                        }
-                    )
-            time.sleep(config.loop_sec)
-            continue
-
-        if not in_position:
-            if config.trade_on_start and (not traded_once) and (not orders) and (not in_exit_grace):
-                response = broker.place_market_with_brackets(
-                    account_id=config.account_id,
-                    contract_id=contract_id,
-                    side=config.side if config.side in (0, 1) else BUY,
-                    size=config.size,
-                    sl_ticks_abs=config.sl_ticks,
-                    tp_ticks_abs=config.tp_ticks,
-                )
-                if telemetry is not None:
-                    telemetry.emit_execution(
-                        {
-                            "event_name": "legacy_entry",
-                            "contract_id": contract_id,
-                            "side": _strategy_side_name(config.side if config.side in (0, 1) else BUY),
-                            "size": int(config.size),
-                            "sl_ticks_abs": int(config.sl_ticks),
-                            "tp_ticks_abs": int(config.tp_ticks),
-                            "success": bool(response.get("success")),
-                            "raw_response": response,
-                        }
-                    )
-                if response.get("success"):
-                    traded_once = True
-                else:
-                    _runtime_log(profile, telemetry, "legacy-trade-rejected", response=response)
-        else:
-            if len(orders) < 2:
-                _runtime_log(profile, telemetry, "legacy-missing-brackets", contract_id=contract_id)
-                cancel_attempted, close_attempted = broker.flatten(config.account_id)
-                if telemetry is not None:
-                    telemetry.emit_execution(
-                        {
-                            "event_name": "flatten",
-                            "source": "legacy_missing_brackets",
-                            "contract_id": contract_id,
-                            "cancel_attempted": bool(cancel_attempted),
-                            "close_attempted": bool(close_attempted),
-                        }
-                    )
-
-        if telemetry is not None and price is not None:
-            telemetry.emit_performance(
-                {
-                    "event_name": "legacy_snapshot",
-                    "contract_id": contract_id,
-                    "price": round(price, 6),
-                    "in_position": bool(in_position),
-                    "open_orders": len(orders),
-                    "open_positions": len(positions),
-                    "drawdown_tripped": bool(drawdown_tripped),
-                }
-            )
-
-        time.sleep(config.loop_sec)
 
 
 def _run_strategy_loop(
@@ -938,7 +768,7 @@ def _run_strategy_loop(
 
 def run(
     config: RuntimeConfig,
-    strategy: Strategy | None = None,
+    strategy: Strategy,
     *,
     profile: str = "normal",
     telemetry: TelemetryRouter | None = None,
@@ -948,7 +778,7 @@ def run(
     rt = None
     telemetry_router = telemetry
     if telemetry_router is None:
-        strategy_name = strategy.__class__.__name__ if strategy is not None else "legacy"
+        strategy_name = strategy.__class__.__name__
         telemetry_router = TelemetryRouter.from_env(profile=profile, mode="forward", strategy=strategy_name)
 
     try:
@@ -981,33 +811,23 @@ def run(
                 important=_is_debug(profile),
             )
 
-        if strategy is None:
-            _run_legacy_loop(
-                config,
-                broker,
-                contract_id,
-                rt,
-                profile=profile,
-                telemetry=telemetry_router,
-            )
-        else:
-            _runtime_log(
-                profile,
-                telemetry_router,
-                f"strategy_runtime={strategy.__class__.__name__}",
-                important=True,
-            )
-            if os.getenv("STRAT_REQUIRE_ORDERFLOW", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
-                _runtime_log(profile, telemetry_router, "orderflow_gate=enabled", important=True)
-            _run_strategy_loop(
-                config,
-                broker,
-                contract_id,
-                rt,
-                strategy,
-                profile=profile,
-                telemetry=telemetry_router,
-            )
+        _runtime_log(
+            profile,
+            telemetry_router,
+            f"strategy_runtime={strategy.__class__.__name__}",
+            important=True,
+        )
+        if os.getenv("STRAT_REQUIRE_ORDERFLOW", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+            _runtime_log(profile, telemetry_router, "orderflow_gate=enabled", important=True)
+        _run_strategy_loop(
+            config,
+            broker,
+            contract_id,
+            rt,
+            strategy,
+            profile=profile,
+            telemetry=telemetry_router,
+        )
     except KeyboardInterrupt:
         _runtime_log(profile, telemetry_router, "Stopping bot.", important=True)
     finally:
@@ -1017,7 +837,10 @@ def run(
 
 
 def main() -> None:
-    run(load_runtime_config())
+    raise RuntimeError(
+        "Direct bot_runtime execution is no longer supported. "
+        "Use scripts/execution/start_trading.py --mode forward."
+    )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,9 @@
 from importlib import import_module
 from typing import Any
 
-__all__ = ["RealtimeClient", "main", "ModeOptions", "run_mode", "DrawdownGuard", "DrawdownSnapshot"]
+__all__ = ["ModeOptions", "run_mode", "DrawdownGuard", "DrawdownSnapshot"]
 
 _ATTR_TO_MODULE = {
-    "RealtimeClient": "realtime_client",
-    "main": "bot_runtime",
     "ModeOptions": "mode_runner",
     "run_mode": "mode_runner",
     "DrawdownGuard": "drawdown_guard",

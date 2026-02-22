@@ -1,42 +1,106 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from trading_algo.backtest import load_bars_from_csv
+
+_FEATURE_COLUMNS = [
+    "has_recent_sweep",
+    "bias_ok",
+    "continuation",
+    "reversal",
+    "equal_levels",
+    "fib_retracement",
+    "key_area_proximity",
+    "confluence_score",
+    "of_imbalance",
+    "of_top_bid_size",
+    "of_top_ask_size",
+    "of_best_bid",
+    "of_best_ask",
+    "of_spread",
+    "of_trade_size",
+    "of_trade_price",
+    "ml_shadow_score",
+]
+
+
+def _coerce_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _coerce_label(row: dict[str, list[Any]], idx: int) -> int | None:
+    win_values = row.get("win")
+    if win_values is not None:
+        raw = win_values[idx]
+        if raw is None:
+            return None
+        if isinstance(raw, bool):
+            return 1 if raw else 0
+        try:
+            return 1 if int(raw) > 0 else 0
+        except (TypeError, ValueError):
+            return None
+    result_label = row.get("result_label")
+    if result_label is None:
+        return None
+    text = str(result_label[idx] or "").strip().lower()
+    if text == "win":
+        return 1
+    if text in {"loss", "flat"}:
+        return 0
+    return None
 
 
 def _build_features_and_labels(path: str) -> tuple[list[list[float]], list[int]]:
-    bars = load_bars_from_csv(path)
-    if len(bars) < 5:
-        raise RuntimeError("Need at least 5 bars to build training features")
+    try:
+        import pyarrow.dataset as ds  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover - runtime dependency path
+        raise RuntimeError("Training from parquet requires `pyarrow`. Install with `py -3.11 -m pip install pyarrow`.") from exc
+
+    dataset = ds.dataset(path, format="parquet")
+    table = dataset.to_table()
+    if table.num_rows <= 0:
+        raise RuntimeError(f"No rows found in parquet dataset: {path}")
+    data = table.to_pydict()
+    rows = int(table.num_rows)
 
     x: list[list[float]] = []
     y: list[int] = []
-    for i in range(3, len(bars) - 1):
-        b0 = bars[i]
-        b1 = bars[i - 1]
-        b2 = bars[i - 2]
-        b3 = bars[i - 3]
-        next_bar = bars[i + 1]
+    for idx in range(rows):
+        label = _coerce_label(data, idx)
+        if label is None:
+            continue
+        features = []
+        for col in _FEATURE_COLUMNS:
+            values = data.get(col)
+            value = values[idx] if values is not None else None
+            features.append(_coerce_float(value))
+        x.append(features)
+        y.append(label)
 
-        ret_1 = (b0.close - b1.close) / b1.close if b1.close else 0.0
-        ret_2 = (b1.close - b2.close) / b2.close if b2.close else 0.0
-        ret_3 = (b2.close - b3.close) / b3.close if b3.close else 0.0
-        range_pct = (b0.high - b0.low) / b0.close if b0.close else 0.0
-        vol_chg = (b0.volume - b1.volume) / b1.volume if b1.volume else 0.0
-        x.append([ret_1, ret_2, ret_3, range_pct, vol_chg])
-        y.append(1 if next_bar.close > b0.close else 0)
+    if len(x) < 20:
+        raise RuntimeError(
+            f"Need at least 20 labeled rows for training, found {len(x)} in parquet dataset: {path}"
+        )
     return x, y
 
 
-def train_xgboost_from_csv(data_csv: str, model_out: str) -> None:
-    x, y = _build_features_and_labels(data_csv)
+def train_xgboost_from_parquet(data_path: str, model_out: str) -> None:
+    x, y = _build_features_and_labels(data_path)
     split = max(1, int(len(x) * 0.8))
     x_train, x_valid = x[:split], x[split:]
     y_train, y_valid = y[:split], y[split:]
 
     try:
-        import xgboost as xgb  # type: ignore
+        import xgboost as xgb  # type: ignore[import-not-found]
     except Exception:
         print("xgboost is not installed. Install it with: pip install xgboost")
         print(f"Prepared dataset rows: train={len(x_train)} valid={len(x_valid)}")
@@ -64,4 +128,3 @@ def train_xgboost_from_csv(data_csv: str, model_out: str) -> None:
     booster.save_model(str(out_path))
     print(f"Model saved: {out_path}")
     print(f"Rows used: train={len(x_train)} valid={len(x_valid)}")
-

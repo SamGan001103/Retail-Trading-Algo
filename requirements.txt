@@ -1,4 +1,6 @@
 python-dotenv
+pyarrow
 requests
 signalrcore
+tzdata
 pytest

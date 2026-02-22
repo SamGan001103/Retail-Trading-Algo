@@ -1,25 +1,27 @@
 from __future__ import annotations
 
 import calendar
-import csv
 import os
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from trading_algo.backtest import (
     BacktestConfig,
+    OrderFlowParquetScan,
     OrderFlowTick,
-    load_bars_from_csv,
-    load_orderflow_ticks_from_csv,
-    run_backtest as run_backtest_sim,
+    is_orderflow_parquet_path,
+    iter_orderflow_ticks_from_parquet,
+    orderflow_tick_has_usable_depth,
     run_backtest_orderflow,
+    scan_orderflow_parquet,
 )
 from trading_algo.config import RuntimeConfig, env_bool, env_float, env_int, get_symbol_profile, load_runtime_config, must_env
 from trading_algo.core import BUY, SELL
-from trading_algo.ml import SetupMLGate, train_xgboost_from_csv
+from trading_algo.ml import SetupMLGate, train_xgboost_from_parquet
 from trading_algo.strategy import MarketBar, NYSessionMarketStructureStrategy, OneShotLongStrategy
 from trading_algo.telemetry import TelemetryRouter
 
@@ -27,7 +29,7 @@ from trading_algo.telemetry import TelemetryRouter
 @dataclass(frozen=True)
 class ModeOptions:
     mode: str
-    data_csv: str | None
+    data_path: str | None
     strategy: str
     model_out: str
     hold_bars: int
@@ -46,6 +48,9 @@ class _WindowSpec:
 class _RunScenario:
     scenario_id: str
     config: BacktestConfig
+
+
+_TZ_FALLBACK_WARNED: set[str] = set()
 
 
 _BACKTEST_CANDIDATE_COLUMNS = [
@@ -156,7 +161,7 @@ _BACKTEST_MATRIX_COLUMNS = [
 _BACKTEST_SUMMARY_COLUMNS = [
     "run_id",
     "strategy",
-    "source_csv",
+    "source_path",
     "scenario_id",
     "window_id",
     "window_start_utc",
@@ -347,20 +352,7 @@ def _ticks_in_window(parsed_ticks: list[tuple[OrderFlowTick, datetime]], window:
 
 
 def _tick_has_usable_orderflow(tick: OrderFlowTick) -> bool:
-    depth = tick.depth
-    if not isinstance(depth, dict):
-        return False
-    bids = depth.get("bids")
-    asks = depth.get("asks")
-    if isinstance(bids, list) and len(bids) > 0:
-        return True
-    if isinstance(asks, list) and len(asks) > 0:
-        return True
-    for key in ("bestBidSize", "bidSize", "bestAskSize", "askSize"):
-        value = depth.get(key)
-        if isinstance(value, (int, float)) and float(value) > 0:
-            return True
-    return False
+    return orderflow_tick_has_usable_depth(tick)
 
 
 def _ensure_orderflow_backtest_dataset(ticks: list[OrderFlowTick], path: str) -> None:
@@ -368,7 +360,7 @@ def _ensure_orderflow_backtest_dataset(ticks: list[OrderFlowTick], path: str) ->
         return
     raise RuntimeError(
         "Backtest orderflow replay requires depth-capable rows. "
-        f"No usable depth data found in CSV: {path}. "
+        f"No usable depth data found in source rows: {path}. "
         "Provide bestBidSize/bestAskSize or depth_bids/depth_asks JSON columns."
     )
 
@@ -393,12 +385,31 @@ def _parse_hhmm_optional(raw: str, fallback: str) -> time:
     return time(hour=hour, minute=minute)
 
 
-def _in_session_utc(dt_utc: datetime, *, start: time, end: time, tz_name: str) -> bool:
+def _resolve_tzinfo(tz_name: str) -> tzinfo:
+    key = str(tz_name or "").strip() or "UTC"
     try:
-        dt_local = dt_utc.astimezone(ZoneInfo(tz_name))
-    except ZoneInfoNotFoundError:
-        dt_local = dt_utc
-    if dt_local.weekday() >= 5:
+        return ZoneInfo(key)
+    except (ZoneInfoNotFoundError, ValueError):
+        if key not in _TZ_FALLBACK_WARNED:
+            _TZ_FALLBACK_WARNED.add(key)
+            print(
+                f"timezone_warning source=mode_runner tz={key} resolved=UTC "
+                "hint=install tzdata to ensure local-session filtering is accurate."
+            )
+        return timezone.utc
+
+
+def _in_session_utc(
+    dt_utc: datetime,
+    *,
+    start: time,
+    end: time,
+    tz_name: str | tzinfo,
+    weekdays_only: bool = True,
+) -> bool:
+    tz = _resolve_tzinfo(tz_name) if isinstance(tz_name, str) else tz_name
+    dt_local = dt_utc.astimezone(tz)
+    if weekdays_only and dt_local.weekday() >= 5:
         return False
     t = dt_local.time()
     if start <= end:
@@ -415,13 +426,14 @@ def _timestamp_has_explicit_tz(raw: str) -> bool:
     return False
 
 
-def _validate_orderflow_backtest_preflight(
+def _validate_orderflow_backtest_preflight_parquet(
     *,
-    data_csv: str,
-    ticks: list[OrderFlowTick],
+    data_path: str,
+    scan: OrderFlowParquetScan,
     window_start: datetime | None,
     window_end: datetime | None,
     news_blackouts: list[tuple[datetime, datetime]] | None,
+    session_weekdays_only: bool = True,
 ) -> dict[str, Any]:
     strict = env_bool("BACKTEST_PREFLIGHT_STRICT", True)
     require_seq = env_bool("BACKTEST_PREFLIGHT_REQUIRE_SEQ", True)
@@ -429,79 +441,28 @@ def _validate_orderflow_backtest_preflight(
     min_depth_coverage = max(0.0, min(1.0, env_float("BACKTEST_PREFLIGHT_MIN_DEPTH_COVERAGE", 0.90)))
     min_rows = max(1, env_int("BACKTEST_PREFLIGHT_MIN_ROWS", 1))
     min_ny_rows = max(0, env_int("BACKTEST_PREFLIGHT_MIN_SESSION_ROWS", 1))
-    ny_start = _parse_hhmm_optional(os.getenv("STRAT_NY_SESSION_START") or "", "09:30")
-    ny_end = _parse_hhmm_optional(os.getenv("STRAT_NY_SESSION_END") or "", "16:00")
-    tz_name = (os.getenv("STRAT_TZ_NAME") or "America/New_York").strip() or "America/New_York"
-
-    with Path(data_csv).open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        headers = list(reader.fieldnames or [])
-        ts_values: list[str] = []
-        for row in reader:
-            ts_raw = _pick_optional(row, "timestamp", "datetime", "time", "date")
-            if ts_raw is not None:
-                ts_values.append(ts_raw)
-
+    rows = int(scan.rows)
+    headers = list(scan.columns)
     errors: list[str] = []
-    if not _has_any_column(headers, ("timestamp", "datetime", "time", "date")):
+
+    if not _has_any_column(headers, ("timestamp", "datetime", "time", "date", "ts_event", "ts_recv")):
         errors.append("missing timestamp column")
     if require_seq and not _has_any_column(headers, ("seq", "sequence", "event_seq", "eventSequence")):
         errors.append("missing seq column (required for deterministic replay)")
-    if len(ticks) < min_rows:
-        errors.append(f"rows={len(ticks)} below minimum {min_rows}")
+    if rows < min_rows:
+        errors.append(f"rows={rows} below minimum {min_rows}")
+    if rows <= 0:
+        errors.append("no rows after session/time filtering")
 
-    explicit_tz_count = 0
-    parseable_count = 0
-    for raw_ts in ts_values:
-        if _timestamp_has_explicit_tz(raw_ts):
-            explicit_tz_count += 1
-        if _parse_ts_utc(raw_ts) is not None:
-            parseable_count += 1
-    ts_total = len(ts_values)
-    if ts_total == 0:
-        errors.append("no timestamp values in CSV rows")
-    else:
-        if parseable_count != ts_total:
-            errors.append(f"unparseable timestamps={ts_total - parseable_count}")
-        if explicit_tz_count != ts_total:
-            errors.append(f"timestamps without explicit timezone={ts_total - explicit_tz_count}")
+    if scan.parseable_timestamps != rows:
+        errors.append(f"unparseable timestamps={rows - scan.parseable_timestamps}")
+    if scan.explicit_tz_timestamps != rows:
+        errors.append(f"timestamps without explicit timezone={rows - scan.explicit_tz_timestamps}")
 
-    monotonic_ok = True
-    prev_key: tuple[datetime, int] | None = None
-    for i, tick in enumerate(ticks):
-        dt = _parse_ts_utc(tick.ts)
-        if dt is None:
-            monotonic_ok = False
-            break
-        key = (dt, int(tick.seq) if int(tick.seq) > 0 else i + 1)
-        if prev_key is not None and key < prev_key:
-            monotonic_ok = False
-            break
-        prev_key = key
-    if not monotonic_ok:
-        errors.append("events are not monotonic by (timestamp, seq)")
-
-    total = max(1, len(ticks))
-    quote_rows = 0
-    depth_rows = 0
-    session_rows = 0
-    for tick in ticks:
-        bid = _num_from_payload(tick.quote, "bid", "bidprice", "bestbid")
-        ask = _num_from_payload(tick.quote, "ask", "askprice", "bestask")
-        if bid is None:
-            bid = _num_from_payload(tick.depth, "bestbid", "bidprice")
-        if ask is None:
-            ask = _num_from_payload(tick.depth, "bestask", "askprice")
-        if bid is not None and ask is not None:
-            quote_rows += 1
-        if _tick_has_usable_orderflow(tick):
-            depth_rows += 1
-        ts = _parse_ts_utc(tick.ts)
-        if ts is not None and _in_session_utc(ts, start=ny_start, end=ny_end, tz_name=tz_name):
-            session_rows += 1
-
-    quote_cov = quote_rows / total
-    depth_cov = depth_rows / total
+    total = max(1, rows)
+    quote_cov = float(scan.quote_rows) / total
+    depth_cov = float(scan.depth_rows) / total
+    session_rows = rows if session_weekdays_only else max(rows, min_ny_rows)
     if quote_cov < min_quote_coverage:
         errors.append(f"quote coverage={quote_cov:.3f} below minimum {min_quote_coverage:.3f}")
     if depth_cov < min_depth_coverage:
@@ -510,14 +471,14 @@ def _validate_orderflow_backtest_preflight(
         errors.append(f"NY session rows={session_rows} below minimum {min_ny_rows}")
 
     if env_bool("STRAT_AVOID_NEWS", False):
-        news_csv = (os.getenv("BACKTEST_NEWS_CSV") or "").strip()
-        if news_csv == "":
-            errors.append("STRAT_AVOID_NEWS=true but BACKTEST_NEWS_CSV is empty")
+        news_path = _resolve_backtest_news_path()
+        if news_path == "":
+            errors.append("STRAT_AVOID_NEWS=true but BACKTEST_NEWS_PATH is empty")
         elif (news_blackouts or []) == []:
-            errors.append("news CSV loaded but no blackout intervals overlap the selected window")
+            errors.append("news dataset loaded but no blackout intervals overlap the selected window")
 
     report = {
-        "rows": len(ticks),
+        "rows": rows,
         "headers": headers,
         "quote_coverage": round(quote_cov, 6),
         "depth_coverage": round(depth_cov, 6),
@@ -526,6 +487,7 @@ def _validate_orderflow_backtest_preflight(
         "window_end": window_end.isoformat().replace("+00:00", "Z") if window_end is not None else None,
         "news_blackouts": len(news_blackouts or []),
         "strict": strict,
+        "source": data_path,
     }
     if strict and errors:
         raise RuntimeError("backtest-preflight-failed: " + "; ".join(errors))
@@ -540,7 +502,7 @@ def _validate_orderflow_backtest_preflight(
     return report
 
 
-def _pick_optional(row: dict[str, str], *keys: str) -> str | None:
+def _pick_optional(row: dict[str, Any], *keys: str) -> str | None:
     lowered = {str(k).strip().lower(): v for k, v in row.items()}
     for key in keys:
         value = lowered.get(key.lower())
@@ -568,7 +530,7 @@ def _num_from_payload(payload: dict[str, Any] | None, *keys: str) -> float | Non
     return None
 
 
-def _is_major_news_row(row: dict[str, str]) -> bool:
+def _is_major_news_row(row: dict[str, Any]) -> bool:
     raw = _pick_optional(row, "impact", "importance", "severity", "priority", "rank", "impact_level")
     if raw is None:
         return True
@@ -605,8 +567,35 @@ def _merge_intervals(intervals: list[tuple[datetime, datetime]]) -> list[tuple[d
     return merged
 
 
+def _resolve_backtest_news_path() -> str:
+    return (os.getenv("BACKTEST_NEWS_PATH") or "").strip()
+
+
+def _iter_news_rows(path: Path) -> list[dict[str, Any]]:
+    if (not path.is_dir()) and path.suffix.lower() != ".parquet":
+        raise RuntimeError(
+            f"Unsupported news data path: {path}. BACKTEST_NEWS_PATH must point to parquet data."
+        )
+    try:
+        import pyarrow.dataset as ds  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover - runtime dependency path
+        raise RuntimeError(
+            "Parquet news loading requires `pyarrow`. Install with `py -3.11 -m pip install pyarrow`."
+        ) from exc
+    table = ds.dataset(str(path), format="parquet").to_table()
+    cols = table.to_pydict()
+    if not cols:
+        return []
+    names = list(cols.keys())
+    rows = len(cols[names[0]])
+    out: list[dict[str, Any]] = []
+    for i in range(rows):
+        out.append({name: cols[name][i] for name in names})
+    return out
+
+
 def _load_major_news_blackouts(
-    csv_path: str | None,
+    news_path: str | None,
     *,
     pre_minutes: int,
     post_minutes: int,
@@ -615,88 +604,251 @@ def _load_major_news_blackouts(
     major_only: bool = True,
     currencies: tuple[str, ...] = ("USD",),
 ) -> list[tuple[datetime, datetime]]:
-    if csv_path is None or csv_path.strip() == "":
+    if news_path is None or news_path.strip() == "":
         return []
-    path = Path(csv_path.strip())
+    path = Path(news_path.strip())
     if not path.exists():
-        raise FileNotFoundError(f"News CSV not found: {csv_path}")
+        raise FileNotFoundError(f"News data not found: {news_path}")
 
     pre_delta = timedelta(minutes=max(0, int(pre_minutes)))
     post_delta = timedelta(minutes=max(0, int(post_minutes)))
     allow_ccy = {x.strip().upper() for x in currencies if x.strip() != ""}
     intervals: list[tuple[datetime, datetime]] = []
-    with path.open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if major_only and not _is_major_news_row(row):
+    for row in _iter_news_rows(path):
+        if major_only and not _is_major_news_row(row):
+            continue
+        if allow_ccy:
+            ccy = _pick_optional(row, "currency", "ccy", "curr", "country")
+            if ccy is not None and ccy.strip().upper() not in allow_ccy:
                 continue
-            if allow_ccy:
-                ccy = _pick_optional(row, "currency", "ccy", "curr", "country")
-                if ccy is not None and ccy.strip().upper() not in allow_ccy:
-                    continue
-            ts_raw = _pick_optional(row, "timestamp", "datetime", "time", "date")
-            if ts_raw is None:
-                continue
-            event_dt = _parse_ts_utc(ts_raw)
-            if event_dt is None:
-                continue
-            start = event_dt - pre_delta
-            end = event_dt + post_delta
-            if window_start is not None and end < window_start:
-                continue
-            if window_end is not None and start > window_end:
-                continue
-            intervals.append((start, end))
+        ts_raw = _pick_optional(row, "timestamp", "datetime", "time", "date")
+        if ts_raw is None:
+            continue
+        event_dt = _parse_ts_utc(ts_raw)
+        if event_dt is None:
+            continue
+        start = event_dt - pre_delta
+        end = event_dt + post_delta
+        if window_start is not None and end < window_start:
+            continue
+        if window_end is not None and start > window_end:
+            continue
+        intervals.append((start, end))
     return _merge_intervals(intervals)
 
 
-def _read_csv_header(path: Path) -> list[str] | None:
+def _load_pyarrow_backtest_writers() -> tuple[Any, Any]:
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-    except OSError:
+        import pyarrow as pa  # type: ignore[import-not-found]
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover - runtime dependency path
+        raise RuntimeError(
+            "Backtest parquet output requires `pyarrow`. Install with `py -3.11 -m pip install pyarrow`."
+        ) from exc
+    return pa, pq
+
+
+def _parquet_dataset_dir(path: str) -> Path:
+    raw = Path(path)
+    if raw.suffix.lower() == ".parquet":
+        return raw.with_suffix("")
+    return raw
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if value is None:
         return None
-    if header is None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
         return None
-    return [str(col).strip() for col in header]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _rotate_incompatible_csv(path: Path, *, expected: list[str], actual: list[str] | None) -> None:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    suffix = 0
-    while True:
-        tag = f".legacy_{stamp}" if suffix == 0 else f".legacy_{stamp}_{suffix}"
-        rotated = path.with_name(f"{path.stem}{tag}{path.suffix}")
-        if not rotated.exists():
-            break
-        suffix += 1
-    path.replace(rotated)
-    expected_text = ",".join(expected)
-    actual_text = ",".join(actual) if actual is not None else "<missing-header>"
-    print(
-        "backtest_csv_header_rotate "
-        f"path={path} moved_to={rotated} "
-        f"expected={expected_text} found={actual_text}"
-    )
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _ensure_csv_header(path: Path, fieldnames: list[str]) -> None:
-    expected = [str(name).strip() for name in fieldnames]
-    if path.exists() and path.stat().st_size > 0:
-        actual = _read_csv_header(path)
-        if actual == expected:
-            return
-        _rotate_incompatible_csv(path, expected=expected, actual=actual)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-
-class _BacktestCandidateCsvWriter:
+class _ParquetDatasetAppender:
     def __init__(
         self,
-        csv_path: str,
+        dataset_path: str,
+        *,
+        columns: list[str],
+        int_columns: set[str],
+        float_columns: set[str],
+        bool_columns: set[str],
+        flush_rows: int = 2_000,
+    ) -> None:
+        self._pa, self._pq = _load_pyarrow_backtest_writers()
+        self._columns = [str(col).strip() for col in columns]
+        self._int_columns = set(int_columns)
+        self._float_columns = set(float_columns)
+        self._bool_columns = set(bool_columns)
+        self._flush_rows = max(1, int(flush_rows))
+        self._rows: list[dict[str, Any]] = []
+        self._dataset_dir = _parquet_dataset_dir(dataset_path)
+        if self._dataset_dir.exists() and self._dataset_dir.is_file():
+            raise RuntimeError(f"Backtest parquet output path must be a directory: {self._dataset_dir}")
+        self._dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> str:
+        return str(self._dataset_dir)
+
+    def _coerce_value(self, key: str, value: Any) -> Any:
+        if key in self._bool_columns:
+            return _coerce_bool(value)
+        if key in self._int_columns:
+            return _coerce_int(value)
+        if key in self._float_columns:
+            return _coerce_float(value)
+        if value is None:
+            return None
+        return str(value)
+
+    def append_row(self, row: dict[str, Any]) -> None:
+        self._rows.append({key: self._coerce_value(key, row.get(key)) for key in self._columns})
+        if len(self._rows) >= self._flush_rows:
+            self.flush()
+
+    def append_rows(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        for row in rows:
+            self.append_row(row)
+
+    def flush(self) -> None:
+        if not self._rows:
+            return
+        arrays = []
+        fields = []
+        for key in self._columns:
+            if key in self._bool_columns:
+                dtype = self._pa.bool_()
+            elif key in self._int_columns:
+                dtype = self._pa.int64()
+            elif key in self._float_columns:
+                dtype = self._pa.float64()
+            else:
+                dtype = self._pa.string()
+            fields.append(self._pa.field(key, dtype))
+            arrays.append(self._pa.array([row.get(key) for row in self._rows], type=dtype))
+        schema = self._pa.schema(fields)
+        table = self._pa.Table.from_arrays(arrays, schema=schema)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        part = self._dataset_dir / f"part-{stamp}-{uuid.uuid4().hex}.parquet"
+        self._pq.write_table(table, str(part), compression="zstd")
+        self._rows = []
+
+    def close(self) -> None:
+        self.flush()
+
+
+_CANDIDATE_BOOL_COLUMNS = {
+    "has_recent_sweep",
+    "bias_ok",
+    "continuation",
+    "reversal",
+    "equal_levels",
+    "fib_retracement",
+    "key_area_proximity",
+    "ml_shadow_approved",
+}
+_CANDIDATE_INT_COLUMNS = {"window_months", "bar_index", "setup_index", "confluence_score"}
+_CANDIDATE_FLOAT_COLUMNS = {
+    "setup_close",
+    "of_imbalance",
+    "of_top_bid_size",
+    "of_top_ask_size",
+    "of_best_bid",
+    "of_best_ask",
+    "of_spread",
+    "of_trade_size",
+    "of_trade_price",
+    "ml_shadow_score",
+}
+
+
+_MATRIX_BOOL_COLUMNS = {
+    "has_recent_sweep",
+    "bias_ok",
+    "continuation",
+    "reversal",
+    "equal_levels",
+    "fib_retracement",
+    "key_area_proximity",
+    "ml_shadow_approved",
+    "win",
+    "loss",
+}
+_MATRIX_INT_COLUMNS = {
+    "window_months",
+    "setup_index",
+    "entry_bar_index",
+    "exit_bar_index",
+    "entry_count",
+    "exit_count",
+    "size",
+    "sl_ticks_abs",
+    "tp_ticks_abs",
+    "confluence_score",
+}
+_MATRIX_FLOAT_COLUMNS = {
+    "setup_close",
+    "of_imbalance",
+    "of_top_bid_size",
+    "of_top_ask_size",
+    "of_best_bid",
+    "of_best_ask",
+    "of_spread",
+    "of_trade_size",
+    "of_trade_price",
+    "ml_shadow_score",
+    "entry_price",
+    "exit_price",
+    "risk_dollars",
+    "gross_entry_size",
+    "gross_exit_size",
+    "pnl",
+    "realized_rr",
+}
+
+
+_SUMMARY_BOOL_COLUMNS = {"orderflow_replay"}
+_SUMMARY_INT_COLUMNS = {"window_months", "bars", "num_trades", "news_blackouts"}
+_SUMMARY_FLOAT_COLUMNS = {
+    "final_equity",
+    "net_pnl",
+    "return_pct",
+    "win_rate_pct",
+    "max_drawdown_pct",
+}
+
+
+class _BacktestCandidateParquetWriter:
+    def __init__(
+        self,
+        parquet_path: str,
         *,
         run_id: str,
         strategy: str,
@@ -706,8 +858,14 @@ class _BacktestCandidateCsvWriter:
         window_start_utc: datetime | None,
         window_end_utc: datetime | None,
     ) -> None:
-        self._path = Path(csv_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._writer = _ParquetDatasetAppender(
+            parquet_path,
+            columns=_BACKTEST_CANDIDATE_COLUMNS,
+            int_columns=_CANDIDATE_INT_COLUMNS,
+            float_columns=_CANDIDATE_FLOAT_COLUMNS,
+            bool_columns=_CANDIDATE_BOOL_COLUMNS,
+            flush_rows=2_000,
+        )
         self._run_id = run_id
         self._strategy = strategy
         self._scenario_id = scenario_id
@@ -715,14 +873,10 @@ class _BacktestCandidateCsvWriter:
         self._window_months = int(window_months)
         self._window_start_utc = window_start_utc
         self._window_end_utc = window_end_utc
-        self._ensure_header()
 
     @property
     def path(self) -> str:
-        return str(self._path)
-
-    def _ensure_header(self) -> None:
-        _ensure_csv_header(self._path, _BACKTEST_CANDIDATE_COLUMNS)
+        return self._writer.path
 
     def append(self, event: dict[str, Any]) -> None:
         row: dict[str, Any] = {
@@ -773,51 +927,57 @@ class _BacktestCandidateCsvWriter:
             "ml_shadow_approved": event.get("ml_shadow_approved"),
             "source": event.get("source"),
         }
-        with self._path.open("a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=_BACKTEST_CANDIDATE_COLUMNS)
-            writer.writerow(row)
+        self._writer.append_row(row)
+
+    def close(self) -> None:
+        self._writer.close()
 
 
-class _BacktestMatrixCsvWriter:
-    def __init__(self, csv_path: str) -> None:
-        self._path = Path(csv_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_header()
+class _BacktestMatrixParquetWriter:
+    def __init__(self, parquet_path: str) -> None:
+        self._writer = _ParquetDatasetAppender(
+            parquet_path,
+            columns=_BACKTEST_MATRIX_COLUMNS,
+            int_columns=_MATRIX_INT_COLUMNS,
+            float_columns=_MATRIX_FLOAT_COLUMNS,
+            bool_columns=_MATRIX_BOOL_COLUMNS,
+            flush_rows=250,
+        )
 
     @property
     def path(self) -> str:
-        return str(self._path)
-
-    def _ensure_header(self) -> None:
-        _ensure_csv_header(self._path, _BACKTEST_MATRIX_COLUMNS)
+        return self._writer.path
 
     def append_rows(self, rows: list[dict[str, Any]]) -> None:
-        if not rows:
-            return
-        with self._path.open("a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=_BACKTEST_MATRIX_COLUMNS)
-            for row in rows:
-                writer.writerow(row)
+        self._writer.append_rows(rows)
+        self._writer.flush()
+
+    def close(self) -> None:
+        self._writer.close()
 
 
-class _BacktestSummaryCsvWriter:
-    def __init__(self, csv_path: str) -> None:
-        self._path = Path(csv_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_header()
+class _BacktestSummaryParquetWriter:
+    def __init__(self, parquet_path: str) -> None:
+        self._writer = _ParquetDatasetAppender(
+            parquet_path,
+            columns=_BACKTEST_SUMMARY_COLUMNS,
+            int_columns=_SUMMARY_INT_COLUMNS,
+            float_columns=_SUMMARY_FLOAT_COLUMNS,
+            bool_columns=_SUMMARY_BOOL_COLUMNS,
+            flush_rows=50,
+        )
 
     @property
     def path(self) -> str:
-        return str(self._path)
-
-    def _ensure_header(self) -> None:
-        _ensure_csv_header(self._path, _BACKTEST_SUMMARY_COLUMNS)
+        return self._writer.path
 
     def append(self, payload: dict[str, Any]) -> None:
         row = {col: payload.get(col) for col in _BACKTEST_SUMMARY_COLUMNS}
-        with self._path.open("a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=_BACKTEST_SUMMARY_COLUMNS)
-            writer.writerow(row)
+        self._writer.append_row(row)
+        self._writer.flush()
+
+    def close(self) -> None:
+        self._writer.close()
 
 
 class _BacktestMatrixTracker:
@@ -1255,10 +1415,10 @@ def _strategy_from_name(
     raise ValueError(f"Unsupported strategy: {name}")
 
 
-def _resolve_data_csv(explicit: str | None) -> str:
+def _resolve_data_path(explicit: str | None) -> str:
     if explicit and explicit.strip():
         return explicit.strip()
-    return must_env("BACKTEST_DATA_CSV")
+    return must_env("BACKTEST_DATA_PARQUET")
 
 
 def _parse_float_list(raw: str) -> list[float]:
@@ -1366,6 +1526,92 @@ def _build_backtest_scenarios(base_cfg: BacktestConfig) -> list[_RunScenario]:
     return deduped
 
 
+def _assess_backtest_health(
+    *,
+    strategy_name: str,
+    rows: int,
+    candidates: int,
+    entered_candidates: int,
+    matrix_rows: int,
+    trades: int,
+    drawdown_pct: float,
+) -> tuple[str, list[str]]:
+    strategy_key = strategy_name.strip().lower()
+    ny_like = strategy_key in {"ny_structure", "ny_session", "market_structure", "mnq_ny"}
+    min_candidates_default = 1 if ny_like else 0
+    min_trades_default = 1 if ny_like else 0
+    min_candidates = max(0, env_int("BACKTEST_HEALTH_MIN_CANDIDATES", min_candidates_default))
+    min_trades = max(0, env_int("BACKTEST_HEALTH_MIN_TRADES", min_trades_default))
+    max_drawdown_pct = max(0.0, env_float("BACKTEST_HEALTH_MAX_DRAWDOWN_PCT", 50.0))
+
+    reasons: list[str] = []
+    if int(rows) <= 0:
+        reasons.append("empty-window")
+    if int(candidates) < min_candidates:
+        reasons.append(f"low-candidates:{int(candidates)}<{min_candidates}")
+    if int(trades) < min_trades:
+        reasons.append(f"low-trades:{int(trades)}<{min_trades}")
+    if int(candidates) > 0 and int(matrix_rows) == 0:
+        reasons.append("missing-matrix-rows")
+    if max_drawdown_pct > 0 and float(drawdown_pct) > max_drawdown_pct:
+        reasons.append(f"drawdown-breach:{float(drawdown_pct):.2f}>{max_drawdown_pct:.2f}")
+    if int(entered_candidates) > int(candidates):
+        reasons.append("entered-candidates-exceed-candidates")
+
+    return ("ok", []) if not reasons else ("warning", reasons)
+
+
+def _emit_backtest_health(
+    *,
+    telemetry: TelemetryRouter,
+    strategy_name: str,
+    scenario_id: str,
+    window_id: str,
+    rows: int,
+    candidates: int,
+    entered_candidates: int,
+    matrix_rows: int,
+    trades: int,
+    net_pnl: float,
+    drawdown_pct: float,
+    orderflow_replay: bool,
+) -> tuple[str, list[str]]:
+    status, reasons = _assess_backtest_health(
+        strategy_name=strategy_name,
+        rows=rows,
+        candidates=candidates,
+        entered_candidates=entered_candidates,
+        matrix_rows=matrix_rows,
+        trades=trades,
+        drawdown_pct=drawdown_pct,
+    )
+    reason_text = "|".join(reasons) if reasons else "none"
+    telemetry.emit_performance(
+        {
+            "event_name": "backtest_health",
+            "scenario_id": scenario_id,
+            "window_id": window_id,
+            "status": status,
+            "rows": rows,
+            "candidates": candidates,
+            "entered_candidates": entered_candidates,
+            "matrix_rows": matrix_rows,
+            "trades": trades,
+            "net_pnl": round(float(net_pnl), 6),
+            "drawdown_pct": round(float(drawdown_pct), 6),
+            "orderflow_replay": bool(orderflow_replay),
+            "reasons": reason_text,
+        }
+    )
+    print(
+        f"backtest_health status={status} scenario={scenario_id} window_id={window_id} "
+        f"rows={rows} candidates={candidates} entered={entered_candidates} matrix_rows={matrix_rows} "
+        f"trades={trades} net_pnl={float(net_pnl):.2f} drawdown_pct={float(drawdown_pct):.2f} "
+        f"reasons={reason_text}"
+    )
+    return status, reasons
+
+
 def run_forward(config: RuntimeConfig, strategy_name: str, hold_bars: int, profile: str) -> None:
     from trading_algo.runtime.bot_runtime import run as run_forward_runtime
 
@@ -1388,17 +1634,22 @@ def run_forward(config: RuntimeConfig, strategy_name: str, hold_bars: int, profi
     run_forward_runtime(config, strategy=strategy, profile=profile, telemetry=telemetry)
 
 
-def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str) -> None:
-    backtest_months = max(1, env_int("BACKTEST_CANDIDATE_MONTHS", 6))
+def run_backtest(data_path: str, strategy_name: str, hold_bars: int, profile: str) -> None:
+    raw_backtest_months = env_int("BACKTEST_CANDIDATE_MONTHS", 0)
+    backtest_months = int(raw_backtest_months) if int(raw_backtest_months) > 0 else 0
     telemetry = TelemetryRouter.from_env(profile=profile, mode="backtest", strategy=strategy_name)
-    default_candidates_csv = os.path.join(telemetry.cfg.telemetry_dir, "backtest_candidates.csv")
-    candidates_csv_path = (os.getenv("BACKTEST_CANDIDATES_CSV") or default_candidates_csv).strip() or default_candidates_csv
-    default_matrix_csv = os.path.join(telemetry.cfg.telemetry_dir, "backtest_candidate_matrix.csv")
-    matrix_csv_path = (os.getenv("BACKTEST_MATRIX_CSV") or default_matrix_csv).strip() or default_matrix_csv
-    matrix_writer = _BacktestMatrixCsvWriter(matrix_csv_path)
-    default_summary_csv = os.path.join(telemetry.cfg.telemetry_dir, "backtest_summary.csv")
-    summary_csv_path = (os.getenv("BACKTEST_SUMMARY_CSV") or default_summary_csv).strip() or default_summary_csv
-    summary_writer = _BacktestSummaryCsvWriter(summary_csv_path)
+    default_candidates_parquet = os.path.join(telemetry.cfg.telemetry_dir, "backtest_candidates.parquet")
+    candidates_parquet_path = (
+        (os.getenv("BACKTEST_CANDIDATES_PARQUET") or default_candidates_parquet).strip() or default_candidates_parquet
+    )
+    default_matrix_parquet = os.path.join(telemetry.cfg.telemetry_dir, "backtest_candidate_matrix.parquet")
+    matrix_parquet_path = (os.getenv("BACKTEST_MATRIX_PARQUET") or default_matrix_parquet).strip() or default_matrix_parquet
+    matrix_writer = _BacktestMatrixParquetWriter(matrix_parquet_path)
+    default_summary_parquet = os.path.join(telemetry.cfg.telemetry_dir, "backtest_summary.parquet")
+    summary_parquet_path = (
+        (os.getenv("BACKTEST_SUMMARY_PARQUET") or default_summary_parquet).strip() or default_summary_parquet
+    )
+    summary_writer = _BacktestSummaryParquetWriter(summary_parquet_path)
     shadow_gate = _build_backtest_shadow_gate()
 
     symbol = (os.getenv("SYMBOL") or "MNQ").strip().upper()
@@ -1418,74 +1669,117 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
         entry_delay_events=max(0, env_int("BACKTEST_ENTRY_DELAY_EVENTS", 1)),
     )
     scenarios = _build_backtest_scenarios(base_cfg)
-    ny_orderflow_backtest = strategy_name.strip().lower() in {"ny_structure", "ny_session", "market_structure", "mnq_ny"}
     replay_bar_sec = max(1, env_int("BACKTEST_BAR_SEC", env_int("STRAT_FORWARD_BAR_SEC", 60)))
+    orderflow_session_only = env_bool("BACKTEST_ORDERFLOW_SESSION_ONLY", True)
+    orderflow_weekdays_only = bool(orderflow_session_only)
+    orderflow_session_start = (os.getenv("STRAT_NY_SESSION_START") or "09:30").strip()
+    orderflow_session_end = (os.getenv("STRAT_NY_SESSION_END") or "16:00").strip()
+    orderflow_session_tz = (os.getenv("STRAT_TZ_NAME") or "America/New_York").strip() or "America/New_York"
 
     walk_forward = env_bool("BACKTEST_WALK_FORWARD", False)
-    wf_window_months = max(1, env_int("BACKTEST_WF_WINDOW_MONTHS", backtest_months))
+    wf_window_default = backtest_months if backtest_months > 0 else 6
+    wf_window_months = max(1, env_int("BACKTEST_WF_WINDOW_MONTHS", wf_window_default))
     wf_step_months = max(1, env_int("BACKTEST_WF_STEP_MONTHS", 1))
     wf_start = _parse_utc_boundary(os.getenv("BACKTEST_WF_START_UTC") or os.getenv("BACKTEST_WF_START"), end_of_day=False)
     wf_end = _parse_utc_boundary(os.getenv("BACKTEST_WF_END_UTC") or os.getenv("BACKTEST_WF_END"), end_of_day=True)
+    max_rows = max(0, env_int("BACKTEST_MAX_ROWS", 0))
+    if max_rows > 0:
+        print(f"backtest_row_cap enabled=True rows={max_rows} stage=load")
 
     total_rows = 0
     total_trades = 0
     total_net_pnl = 0.0
     total_matrix_rows = 0
     run_count = 0
+    health_strict = env_bool("BACKTEST_HEALTH_STRICT", False)
+    health_warnings = 0
+    parquet_batch_size = max(1, env_int("BACKTEST_PARQUET_BATCH_SIZE", 200_000))
+    orderflow_parquet_input = is_orderflow_parquet_path(data_path)
 
-    if ny_orderflow_backtest:
-        ticks_all = load_orderflow_ticks_from_csv(data_csv)
-        _ensure_orderflow_backtest_dataset(ticks_all, data_csv)
-        parsed_ticks = _parsed_ticks_utc(ticks_all)
-        if not parsed_ticks:
-            raise RuntimeError(f"No parseable orderflow timestamps loaded from CSV: {data_csv}")
-
-        windows: list[_WindowSpec]
-        window_ticks: dict[str, list[OrderFlowTick]] = {}
+    if orderflow_parquet_input:
         if walk_forward:
-            windows = _build_walk_forward_windows(
-                parsed_times_utc=[dt for _, dt in parsed_ticks],
-                window_months=wf_window_months,
-                step_months=wf_step_months,
-                start_utc=wf_start,
-                end_utc=wf_end,
+            raise RuntimeError(
+                "BACKTEST_WALK_FORWARD is not supported with streaming Parquet input yet. "
+                "Disable walk-forward for this run."
             )
-            if not windows:
+
+        stream_start_utc: datetime | None = None
+        if backtest_months > 0:
+            latest_scan = scan_orderflow_parquet(
+                data_path,
+                session_start=orderflow_session_start if orderflow_session_only else None,
+                session_end=orderflow_session_end if orderflow_session_only else None,
+                tz_name=orderflow_session_tz,
+                weekdays_only=orderflow_weekdays_only,
+                max_rows=max_rows if max_rows > 0 else None,
+                batch_size=parquet_batch_size,
+            )
+            if latest_scan.rows <= 0:
+                message = f"No rows loaded from orderflow Parquet: {data_path}"
+                if orderflow_session_only:
+                    raise RuntimeError(
+                        f"{message}. Session filter removed all rows "
+                        f"(session={orderflow_session_start}-{orderflow_session_end}, tz={orderflow_session_tz}). "
+                        "Set BACKTEST_ORDERFLOW_SESSION_ONLY=false to replay all hours, "
+                        "or adjust STRAT_NY_SESSION_START/STRAT_NY_SESSION_END/STRAT_TZ_NAME."
+                    )
+                raise RuntimeError(message)
+            if latest_scan.last_ts_utc is None:
+                raise RuntimeError(f"No parseable orderflow timestamps loaded from Parquet: {data_path}")
+            stream_start_utc = _subtract_months(latest_scan.last_ts_utc, backtest_months)
+
+        parquet_scan = scan_orderflow_parquet(
+            data_path,
+            session_start=orderflow_session_start if orderflow_session_only else None,
+            session_end=orderflow_session_end if orderflow_session_only else None,
+            tz_name=orderflow_session_tz,
+            weekdays_only=orderflow_weekdays_only,
+            max_rows=max_rows if max_rows > 0 else None,
+            batch_size=parquet_batch_size,
+            start_utc=stream_start_utc,
+        )
+        if parquet_scan.rows <= 0:
+            message = f"No rows loaded from orderflow Parquet: {data_path}"
+            if orderflow_session_only:
                 raise RuntimeError(
-                    "Walk-forward produced zero windows. "
-                    "Adjust BACKTEST_WF_WINDOW_MONTHS/BACKTEST_WF_STEP_MONTHS or the start/end bounds."
+                    f"{message}. Session filter removed all rows "
+                    f"(session={orderflow_session_start}-{orderflow_session_end}, tz={orderflow_session_tz}). "
+                    "Set BACKTEST_ORDERFLOW_SESSION_ONLY=false to replay all hours, "
+                    "or adjust STRAT_NY_SESSION_START/STRAT_NY_SESSION_END/STRAT_TZ_NAME."
                 )
-            for window in windows:
-                window_ticks[window.window_id] = _ticks_in_window(parsed_ticks, window)
-        else:
-            selected_ticks, window_start_dt, window_end_dt = _latest_months_window_ticks(ticks_all, backtest_months)
-            start_dt = window_start_dt or min(dt for _, dt in parsed_ticks)
-            end_dt = window_end_dt or max(dt for _, dt in parsed_ticks)
-            single = _WindowSpec(
-                window_id=f"latest_{backtest_months}m",
-                start_utc=start_dt,
-                end_utc=end_dt,
-                months=backtest_months,
+            raise RuntimeError(message)
+        if parquet_scan.depth_rows <= 0:
+            raise RuntimeError(
+                "Backtest orderflow replay requires depth-capable rows. "
+                f"No usable depth data found in Parquet: {data_path}. "
+                "Provide bestBidSize/bestAskSize or depth ladders in the source schema."
             )
-            windows = [single]
-            window_ticks[single.window_id] = selected_ticks
+        if parquet_scan.first_ts_utc is None or parquet_scan.last_ts_utc is None:
+            raise RuntimeError(f"No parseable orderflow timestamps loaded from Parquet: {data_path}")
+
+        window_id = f"latest_{backtest_months}m" if backtest_months > 0 else "full_dataset"
+        window_months = backtest_months if backtest_months > 0 else 0
+        window = _WindowSpec(
+            window_id=window_id,
+            start_utc=parquet_scan.first_ts_utc,
+            end_utc=parquet_scan.last_ts_utc,
+            months=window_months,
+        )
+        windows = [window]
         print(
             f"backtest_plan strategy={strategy_name} orderflow_replay=True "
-            f"walk_forward={walk_forward} windows={len(windows)} scenarios={len(scenarios)}"
+            f"input_format=parquet walk_forward={walk_forward} windows={len(windows)} scenarios={len(scenarios)}"
         )
 
         for scenario in scenarios:
             for window in windows:
-                ticks = window_ticks.get(window.window_id, [])
-                if not ticks:
-                    continue
                 news_blackouts: list[tuple[datetime, datetime]] = []
                 if env_bool("STRAT_AVOID_NEWS", False):
-                    news_csv = (os.getenv("BACKTEST_NEWS_CSV") or "").strip()
-                    if news_csv == "":
-                        print("news_blackout_warning=STRAT_AVOID_NEWS=true but BACKTEST_NEWS_CSV is empty; no events filtered")
+                    news_path = _resolve_backtest_news_path()
+                    if news_path == "":
+                        print("news_blackout_warning=STRAT_AVOID_NEWS=true but BACKTEST_NEWS_PATH is empty; no events filtered")
                     news_blackouts = _load_major_news_blackouts(
-                        news_csv,
+                        news_path,
                         pre_minutes=env_int("BACKTEST_NEWS_PRE_MIN", 15),
                         post_minutes=env_int("BACKTEST_NEWS_POST_MIN", 15),
                         window_start=window.start_utc,
@@ -1497,15 +1791,16 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                             if x.strip() != ""
                         ),
                     )
-                _validate_orderflow_backtest_preflight(
-                    data_csv=data_csv,
-                    ticks=ticks,
+                _validate_orderflow_backtest_preflight_parquet(
+                    data_path=data_path,
+                    scan=parquet_scan,
                     window_start=window.start_utc,
                     window_end=window.end_utc,
                     news_blackouts=news_blackouts,
+                    session_weekdays_only=orderflow_weekdays_only,
                 )
-                csv_writer = _BacktestCandidateCsvWriter(
-                    candidates_csv_path,
+                candidate_writer = _BacktestCandidateParquetWriter(
+                    candidates_parquet_path,
                     run_id=telemetry.cfg.run_id,
                     strategy=strategy_name,
                     scenario_id=scenario.scenario_id,
@@ -1524,13 +1819,17 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                     window_end_utc=window.end_utc,
                     tick_value=tick_value,
                 )
+                run_diag = {"candidates": 0, "entered": 0}
 
                 def _candidate_sink(event: dict[str, Any]) -> None:
                     enriched = _apply_shadow_ml(event, shadow_gate)
                     enriched["scenario_id"] = scenario.scenario_id
                     enriched["window_id"] = window.window_id
+                    run_diag["candidates"] += 1
+                    if str(enriched.get("status") or "").strip().lower() == "entered":
+                        run_diag["entered"] += 1
                     telemetry.emit_candidate(enriched)
-                    csv_writer.append(enriched)
+                    candidate_writer.append(enriched)
                     matrix_tracker.on_candidate_event(enriched)
 
                 def _execution_sink(event: dict[str, Any]) -> None:
@@ -1551,7 +1850,16 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                     getattr(strategy, "set_ml_gate")(None)
 
                 result = run_backtest_orderflow(
-                    ticks,
+                    iter_orderflow_ticks_from_parquet(
+                        data_path,
+                        session_start=orderflow_session_start if orderflow_session_only else None,
+                        session_end=orderflow_session_end if orderflow_session_only else None,
+                        tz_name=orderflow_session_tz,
+                        weekdays_only=orderflow_weekdays_only,
+                        max_rows=max_rows if max_rows > 0 else None,
+                        batch_size=parquet_batch_size,
+                        start_utc=stream_start_utc,
+                    ),
                     strategy,
                     scenario.config,
                     bar_sec=replay_bar_sec,
@@ -1559,7 +1867,7 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                     execution_callback=_execution_sink,
                     candidate_callback=_candidate_sink,
                 )
-                processed_rows = len(ticks)
+                processed_rows = parquet_scan.rows
                 total_rows += processed_rows
                 total_trades += result.num_trades
                 total_net_pnl += result.net_pnl
@@ -1603,7 +1911,7 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                     {
                         "run_id": telemetry.cfg.run_id,
                         "strategy": strategy_name,
-                        "source_csv": data_csv,
+                        "source_path": data_path,
                         "scenario_id": scenario.scenario_id,
                         "window_id": window.window_id,
                         "window_start_utc": window.start_utc.isoformat().replace("+00:00", "Z"),
@@ -1620,6 +1928,28 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                         "news_blackouts": len(news_blackouts),
                     }
                 )
+                health_status, health_reasons = _emit_backtest_health(
+                    telemetry=telemetry,
+                    strategy_name=strategy_name,
+                    scenario_id=scenario.scenario_id,
+                    window_id=window.window_id,
+                    rows=processed_rows,
+                    candidates=int(run_diag["candidates"]),
+                    entered_candidates=int(run_diag["entered"]),
+                    matrix_rows=len(matrix_rows),
+                    trades=result.num_trades,
+                    net_pnl=result.net_pnl,
+                    drawdown_pct=result.max_drawdown_pct,
+                    orderflow_replay=True,
+                )
+                if health_status != "ok":
+                    health_warnings += 1
+                    if health_strict:
+                        raise RuntimeError(
+                            "backtest-health-failed: "
+                            f"scenario={scenario.scenario_id} window_id={window.window_id} "
+                            f"reasons={'|'.join(health_reasons)}"
+                        )
                 print("BACKTEST RESULT")
                 print(
                     f"scenario={scenario.scenario_id} window_id={window.window_id} "
@@ -1631,186 +1961,32 @@ def run_backtest(data_csv: str, strategy_name: str, hold_bars: int, profile: str
                 )
                 print(f"bar_sec={replay_bar_sec}")
                 print(f"news_blackouts={len(news_blackouts)}")
-                print(f"candidate_csv={csv_writer.path}")
-                print(f"matrix_csv={matrix_writer.path} rows={len(matrix_rows)}")
+                candidate_writer.close()
+                print(f"candidate_parquet={candidate_writer.path}")
+                print(f"matrix_parquet={matrix_writer.path} rows={len(matrix_rows)}")
                 print(f"final_equity={result.final_equity:.2f}")
                 print(f"net_pnl={result.net_pnl:.2f} return_pct={result.total_return_pct:.2f}")
                 print(f"win_rate_pct={result.win_rate_pct:.2f} max_drawdown_pct={result.max_drawdown_pct:.2f}")
+
     else:
-        bars_all = load_bars_from_csv(data_csv)
-        parsed_bars = _parsed_bars_utc(bars_all)
-        if not parsed_bars:
-            raise RuntimeError(f"No parseable bar timestamps loaded from CSV: {data_csv}")
-
-        windows = []
-        window_bars: dict[str, list[MarketBar]] = {}
-        if walk_forward:
-            windows = _build_walk_forward_windows(
-                parsed_times_utc=[dt for _, dt in parsed_bars],
-                window_months=wf_window_months,
-                step_months=wf_step_months,
-                start_utc=wf_start,
-                end_utc=wf_end,
-            )
-            if not windows:
-                raise RuntimeError(
-                    "Walk-forward produced zero windows. "
-                    "Adjust BACKTEST_WF_WINDOW_MONTHS/BACKTEST_WF_STEP_MONTHS or the start/end bounds."
-                )
-            for window in windows:
-                window_bars[window.window_id] = _bars_in_window(parsed_bars, window)
-        else:
-            selected_bars, window_start_dt, window_end_dt = _latest_months_window(bars_all, backtest_months)
-            start_dt = window_start_dt or min(dt for _, dt in parsed_bars)
-            end_dt = window_end_dt or max(dt for _, dt in parsed_bars)
-            single = _WindowSpec(
-                window_id=f"latest_{backtest_months}m",
-                start_utc=start_dt,
-                end_utc=end_dt,
-                months=backtest_months,
-            )
-            windows = [single]
-            window_bars[single.window_id] = selected_bars
-        print(
-            f"backtest_plan strategy={strategy_name} orderflow_replay=False "
-            f"walk_forward={walk_forward} windows={len(windows)} scenarios={len(scenarios)}"
+        raise RuntimeError(
+            "Backtest now requires parquet input and orderflow replay. "
+            "Legacy file-based and OHLCV backtest paths were removed."
         )
-
-        for scenario in scenarios:
-            for window in windows:
-                bars = window_bars.get(window.window_id, [])
-                if not bars:
-                    continue
-                csv_writer = _BacktestCandidateCsvWriter(
-                    candidates_csv_path,
-                    run_id=telemetry.cfg.run_id,
-                    strategy=strategy_name,
-                    scenario_id=scenario.scenario_id,
-                    window_id=window.window_id,
-                    window_months=window.months,
-                    window_start_utc=window.start_utc,
-                    window_end_utc=window.end_utc,
-                )
-                matrix_tracker = _BacktestMatrixTracker(
-                    run_id=telemetry.cfg.run_id,
-                    strategy=strategy_name,
-                    scenario_id=scenario.scenario_id,
-                    window_id=window.window_id,
-                    window_months=window.months,
-                    window_start_utc=window.start_utc,
-                    window_end_utc=window.end_utc,
-                    tick_value=tick_value,
-                )
-
-                def _candidate_sink(event: dict[str, Any]) -> None:
-                    enriched = _apply_shadow_ml(event, shadow_gate)
-                    enriched["scenario_id"] = scenario.scenario_id
-                    enriched["window_id"] = window.window_id
-                    telemetry.emit_candidate(enriched)
-                    csv_writer.append(enriched)
-                    matrix_tracker.on_candidate_event(enriched)
-
-                def _execution_sink(event: dict[str, Any]) -> None:
-                    enriched = dict(event)
-                    enriched["scenario_id"] = scenario.scenario_id
-                    enriched["window_id"] = window.window_id
-                    telemetry.emit_execution(enriched)
-                    matrix_tracker.on_execution_event(enriched)
-
-                strategy = _strategy_from_name(strategy_name, hold_bars, for_forward=False)
-                result = run_backtest_sim(
-                    bars,
-                    strategy,
-                    scenario.config,
-                    telemetry_callback=lambda event: telemetry.emit_performance(event),
-                    execution_callback=_execution_sink,
-                    candidate_callback=_candidate_sink,
-                )
-                processed_rows = len(bars)
-                total_rows += processed_rows
-                total_trades += result.num_trades
-                total_net_pnl += result.net_pnl
-                run_count += 1
-
-                telemetry.emit_performance(
-                    {
-                        "event_name": "backtest_summary",
-                        "scenario_id": scenario.scenario_id,
-                        "window_id": window.window_id,
-                        "bars": processed_rows,
-                        "num_trades": result.num_trades,
-                        "final_equity": round(result.final_equity, 6),
-                        "net_pnl": round(result.net_pnl, 6),
-                        "return_pct": round(result.total_return_pct, 6),
-                        "win_rate_pct": round(result.win_rate_pct, 6),
-                        "max_drawdown_pct": round(result.max_drawdown_pct, 6),
-                        "orderflow_replay": False,
-                        "news_blackouts": 0,
-                    }
-                )
-                for trade in result.trades:
-                    telemetry.emit_execution(
-                        {
-                            "event_name": "backtest_trade",
-                            "scenario_id": scenario.scenario_id,
-                            "window_id": window.window_id,
-                            "entry_ts": trade.entry_ts,
-                            "exit_ts": trade.exit_ts,
-                            "side": _strategy_side_name(trade.side),
-                            "size": trade.size,
-                            "entry_price": round(trade.entry_price, 6),
-                            "exit_price": round(trade.exit_price, 6),
-                            "pnl": round(trade.pnl, 6),
-                        }
-                    )
-                matrix_rows = matrix_tracker.finalize_rows()
-                matrix_writer.append_rows(matrix_rows)
-                total_matrix_rows += len(matrix_rows)
-                summary_writer.append(
-                    {
-                        "run_id": telemetry.cfg.run_id,
-                        "strategy": strategy_name,
-                        "source_csv": data_csv,
-                        "scenario_id": scenario.scenario_id,
-                        "window_id": window.window_id,
-                        "window_start_utc": window.start_utc.isoformat().replace("+00:00", "Z"),
-                        "window_end_utc": window.end_utc.isoformat().replace("+00:00", "Z"),
-                        "window_months": window.months,
-                        "bars": processed_rows,
-                        "num_trades": result.num_trades,
-                        "final_equity": round(result.final_equity, 6),
-                        "net_pnl": round(result.net_pnl, 6),
-                        "return_pct": round(result.total_return_pct, 6),
-                        "win_rate_pct": round(result.win_rate_pct, 6),
-                        "max_drawdown_pct": round(result.max_drawdown_pct, 6),
-                        "orderflow_replay": False,
-                        "news_blackouts": 0,
-                    }
-                )
-                print("BACKTEST RESULT")
-                print(
-                    f"scenario={scenario.scenario_id} window_id={window.window_id} "
-                    f"bars={processed_rows} trades={result.num_trades} orderflow_replay=False"
-                )
-                print(
-                    f"window={window.start_utc.isoformat().replace('+00:00', 'Z')}.."
-                    f"{window.end_utc.isoformat().replace('+00:00', 'Z')} months={window.months}"
-                )
-                print(f"candidate_csv={csv_writer.path}")
-                print(f"matrix_csv={matrix_writer.path} rows={len(matrix_rows)}")
-                print(f"final_equity={result.final_equity:.2f}")
-                print(f"net_pnl={result.net_pnl:.2f} return_pct={result.total_return_pct:.2f}")
-                print(f"win_rate_pct={result.win_rate_pct:.2f} max_drawdown_pct={result.max_drawdown_pct:.2f}")
 
     print("BACKTEST AGGREGATE")
     print(f"runs={run_count} bars={total_rows} trades={total_trades} net_pnl={total_net_pnl:.2f}")
-    print(f"candidate_csv={candidates_csv_path}")
-    print(f"matrix_csv={matrix_csv_path} rows={total_matrix_rows}")
-    print(f"summary_csv={summary_csv_path}")
+    matrix_writer.close()
+    summary_writer.close()
+    print(f"candidate_parquet={candidates_parquet_path}")
+    print(f"matrix_parquet={matrix_parquet_path} rows={total_matrix_rows}")
+    print(f"summary_parquet={summary_parquet_path}")
+    aggregate_health = "ok" if health_warnings == 0 else "warning"
+    print(f"backtest_health_aggregate status={aggregate_health} warnings={health_warnings} strict={health_strict}")
 
 
-def run_train(data_csv: str, model_out: str) -> None:
-    train_xgboost_from_csv(data_csv, model_out)
+def run_train(data_path: str, model_out: str) -> None:
+    train_xgboost_from_parquet(data_path, model_out)
 
 
 def run_mode(options: ModeOptions) -> None:
@@ -1820,11 +1996,11 @@ def run_mode(options: ModeOptions) -> None:
         run_forward(load_runtime_config(), options.strategy, options.hold_bars, profile)
         return
 
-    data_csv = _resolve_data_csv(options.data_csv)
+    data_path = _resolve_data_path(options.data_path)
     if mode == "backtest":
-        run_backtest(data_csv, options.strategy, options.hold_bars, profile)
+        run_backtest(data_path, options.strategy, options.hold_bars, profile)
         return
     if mode == "train":
-        run_train(data_csv, options.model_out)
+        run_train(data_path, options.model_out)
         return
     raise ValueError(f"Unsupported mode: {options.mode}. Use forward, backtest, or train.")
